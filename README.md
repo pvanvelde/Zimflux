@@ -9,7 +9,6 @@ For the development of ZIMFLUX, we leverage several powerful tools and functiona
 - [Requirements](#requirements)
 - [Installation and Usage](#installation-and-usage)
 - [Possible Fixes](#possible-fixes)
-- [Contributing](#contributing)
 - [License](#license)
 
 ## Requirements
