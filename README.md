@@ -1,6 +1,6 @@
 # ZIMFLUX
 
-Welcome to the ZIMFLUX repository! ZIMFLUX is an innovative project that blends modulated excitation patterns with Point Spread Function (PSF) engineering. If you're specifically interested in the vectorial PSF model, you might want to explore our related repository, [VectorialPSF](https://github.com/pvanvelde/VectorialPSF). 
+Welcome to the ZIMFLUX repository! ZIMFLUX is a fluorescence microscopy project that combines modulated excitation patterns with Point Spread Function (PSF) engineering. If you're specifically interested in the vectorial PSF model, you might want to explore our related repository, [VectorialPSF](https://github.com/pvanvelde/VectorialPSF). 
 
 For the development of ZIMFLUX, we leverage several powerful tools and functionalities from [PhotonPy](https://github.com/qnano/photonpy). These include fast spot detection and drift correction, enhancing the overall capabilities and precision of our project.
 
@@ -35,7 +35,7 @@ Follow these steps to install and set up the project:
      ```
 
 3. **Install Visual Studio 2019 Community Edition:**
-   - Download and install Visual Studio 2019 Community Edition from [here](https://visualstudio.microsoft.com/downloads/).
+   - Download and install Visual Studio 2019 Community Edition from [here](https://visualstudio.microsoft.com/vs/older-downloads/).
 
 4. **Extract External Libraries:**
    - Extract the external libraries from `cpp/external.zip` so that the `cpp` directory contains a folder called "external."
