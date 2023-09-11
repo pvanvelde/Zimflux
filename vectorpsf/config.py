@@ -86,7 +86,7 @@ def sim_params(depth=0, astig=0, roisize=16):
     if astig!=0:
         params.abberations[1, 2] = astig
     else:
-        params.abberations[:, 2] = (np.load('/vectorpsf/delft_beads_feb23_15nm.npy'))
+        params.abberations[:, 2] = (np.load('../vectorpsf/delft_beads_feb23_15nm.npy'))
         params.abberations[-6, 2] = -0.2
 
 

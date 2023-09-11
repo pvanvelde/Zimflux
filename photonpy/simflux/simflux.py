@@ -1,22 +1,20 @@
 """
-Main SIMFLUX data processing pipeline.
+Main Z/SIMFLUX data processing pipeline.
 
 photonpy - Single molecule localization microscopy library
-© Jelmer Cnossen 2018-2021
+© Jelmer Cnossen - Pieter van Velde 2018-2023
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
-
+import scipy.interpolate
 from photonpy.simflux.spotlist import SpotList
 import math
 import os,pickle
 from photonpy import Context, Dataset
 import sys
-import time
 import tqdm
-from photonpy.cpp.estimator import Estimator
+
 from photonpy.cpp.estim_queue import EstimQueue,EstimQueue_Results
 from photonpy.cpp.roi_queue import ROIQueue
 from photonpy.cpp.gaussian import Gaussian, Gauss3D_Calibration
@@ -106,10 +104,10 @@ def print_mod(reportfn, mod, pattern_frames, pixelsize):
 
 
 
-class SimfluxProcessor:
+class ZimfluxProcessor:
 
     """
-    Simflux processing.
+    Zimflux processing.
     """
     def __init__(self, src_fn, cfg, debugMode=False):
         src_fn = os.path.abspath(src_fn)
@@ -151,15 +149,19 @@ class SimfluxProcessor:
 
         # note that 'phase' is later drift-corrected and a function of time
         self.mod = np.zeros(self.pattern_frames.size,dtype=ModDType)
-
+        self.levmarparams_sf = np.array([1e3, 1e3, 1e3, 1e3, 1e3])
+        self.levmarparams_astig = np.array([1e3, 1e3, 1e3, 1e3, 1e3])
+        self.depth  = cfg['depth']
+        self.dims = 3
+        self.excDims=3
     @staticmethod
     def load(src_fn):
         rois_fn = os.path.splitext(src_fn)[0] + "_rois.npy"
         cfg = load_cache_cfg(rois_fn)
-        s = SimfluxProcessor(src_fn, cfg)
+        s = ZimfluxProcessor(src_fn, cfg)
         s.sum_ds = Dataset.load(s.sum_ds_fn)
         s.imgshape = s.sum_ds.imgshape
-        s.gaussian_fitting()
+        s.spot_fitting()
         s.load_mod()
         return s
 
@@ -191,290 +193,6 @@ class SimfluxProcessor:
     def close(self):
         ...
 
-    def bias_plot2D(self,  tag, iter=False, shift_input=None, pattern=0):
-        g2d_d = self.sum_ds_filtered
-
-        pos = g2d_d.pos[:, :3]
-
-        filter = True
-        if filter:
-            filter_arr = pos[:,0]>5000/65
-        else:
-            filter_arr = np.ones[np.size(pos,0)]
-        pos = pos[filter_arr,:]
-
-        if shift_input is None:
-            sf_d = self.sf_ds
-            shift =  g2d_d.pos[filter_arr, :3] - sf_d.pos[filter_arr, :3]
-        else:
-            shift = shift_input
-
-        cx = np.polyfit(pos[:, 0], shift[:, 0], 1)
-        cy = np.polyfit(pos[:, 1], shift[:, 1], 1)
-        cz = np.polyfit(pos[:, 2], shift[:, 2], 1)
-        rms = np.sqrt(np.mean(shift ** 2, 0))
-        print(f"RMS x shift={rms[0] * self.pixelsize}, y shift={rms[1] * self.pixelsize}")
-
-        w = 25
-
-        print(f"running 2D bias fit over {len(pos)} points")
-
-        gridshape = [w, w]
-
-        #        statfn = 'median'
-
-        def median_mincount(x, minsize):
-            if len(x) < minsize:
-                return np.nan
-            return np.median(x)
-
-        def rms_mincount(x, minsize):
-            if len(x) < minsize:
-                return np.nan
-            return np.sqrt(np.mean(x ** 2))
-
-        statfn = lambda x: median_mincount(x, 20)
-        metric = 'Median bias'
-        #       statfn = lambda x: rms_mincount(x,20)
-        #        metric='RMS'
-        scatter = True
-
-        clustergrid = [w, w]
-        shape = [256, 256]
-
-        shift = shift[ :]
-
-        xysx = fitpoints2D.hist2d_statistic_points(pos[:, 0], pos[:, 1], shift[:, 0], shape, clustergrid,
-                                                   statistic='median')
-        xysy = fitpoints2D.hist2d_statistic_points(pos[:, 0], pos[:, 1], shift[:, 1], shape, clustergrid,
-                                                   statistic='median')
-        xysz = fitpoints2D.hist2d_statistic_points(pos[:, 0], pos[:, 1], shift[:, 2], shape, clustergrid,
-                                                   statistic='median')
-        rms_x = np.sqrt(np.mean(xysx[:, 2] ** 2))
-        rms_y = np.sqrt(np.mean(xysy[:, 2] ** 2))
-        rms_z = np.sqrt(np.mean(xysz[:, 2] ** 2))
-        print(f"RMS clusters x shift={rms_x * self.pixelsize}, y shift={rms_y * self.pixelsize}, z shift = {rms_z } um")
-
-        # print(f"2D bias plot: plotting {len(xysx)} clusters")
-        # figsize = (8, 6)
-        # plt.figure(figsize=figsize)
-        # plt.set_cmap('jet')
-        #
-        # #        plt.imshow(img_x, origin='lower',extent=[0,shape[1],0,shape[0]])
-        # s = self.pixelsize
-        # sc =self.pixelsize
-        #
-        # if scatter: im = plt.scatter(s * xysx[:, 0], s * xysx[:, 1], c=sc * xysx[:, 2])
-        # cb = plt.colorbar()
-        # cb.set_label('Bias in X [nm]')
-        # #plt.clim(-20, 20)
-        #
-        # #cbar.set_clim([-20, 20])
-        # plt.xlabel(u'X position in FOV [um]')
-        # plt.ylabel(u'Y position in FOV [um]')
-        # plt.title(f'{metric} in X over FOV')
-        #
-        # # plt.savefig(self.outdir + tag + "x-bias-fov.png")
-        # # plt.savefig(self.outdir + tag + "x-bias-fov.svg")
-        #
-        # plt.savefig(self.resultprefix + "x-bias-fov_"+ tag+ ".png")
-        #
-        # plt.figure(figsize=figsize)
-        # #       plt.imshow(img_y, origin='lower',  extent=[0,shape[1],0,shape[0]])
-        # if scatter: plt.scatter(s * xysy[:, 0], s * xysy[:, 1], c=sc * xysy[:, 2])
-        # cb = plt.colorbar()
-        # cb.set_label('Bias in Y [nm]')
-        # #plt.clim(-20, 20)
-        # plt.xlabel(u'X position in FOV [um]')
-        # plt.ylabel(u'Y position in FOV [um]')
-        # plt.title(f'{metric} in Y over FOV')
-        # # plt.savefig(self.outdir + tag + "y-bias-fov.png")
-        # # plt.savefig(self.outdir + tag + "y-bias-fov.svg")
-        # plt.savefig(self.resultprefix + " y-bias-fov_"+ tag+ ".png")
-        # plt.figure(figsize=figsize)
-        # if scatter: plt.scatter(s * xysz[:, 0], s * xysz[:, 1], c= xysz[:, 2])
-        # cb = plt.colorbar()
-        # cb.set_label('Bias in Z [um]')
-        # #plt.clim(-0.1, 0.1)
-        # plt.xlabel(u'X position in FOV [um]')
-        # plt.ylabel(u'Y position in FOV [um]')
-        # plt.title(f'{metric} in Z over FOV')
-        # plt.savefig(self.resultprefix + "z-bias-fov_"+ tag+ ".png")
-
-
-        if True:
-            # plot a random subset of the points
-            np.random.seed(0)
-            indices = np.arange(len(pos))  # np.nonzero(np.min( self.IBg[:,:,0],1) > min_intensity)[0]
-            np.random.shuffle(indices)
-            indices = indices[:10000]
-
-            w, h = self.imgshape
-
-            fig, axes = plt.subplots(3, 1, figsize=[12,12])
-            px = np.polyfit(pos[indices, 0], shift[indices, 0], 1)
-            py = np.polyfit(pos[indices, 1], shift[indices, 1], 1)
-            pz = np.polyfit(pos[indices, 2], shift[indices, 2], 1)
-            poszvsx = np.polyfit( pos[indices,0], pos[indices, 2], 1)
-            sx = self.pixelsize
-            sy = self.pixelsize
-            sz = 1
-            kx, ky, kz = np.mean([self.mod[0][0][0], self.mod[1][0][0]]), np.mean([self.mod[0][0][1], self.mod[1][0][1]]), np.mean([self.mod[0][0][2], self.mod[1][0][2]])
-            axes[0].scatter(sx * pos[indices, 0], sy * shift[indices, 0], s=3)
-            axes[0].plot(np.linspace(0, w) * sx, np.polyval(px, np.linspace(0, w)) * sy, 'g-')
-            axes[0].set_title(f'X slope ({cx[0] * kx:.5f} rad/pixel), offset ({cx[1]:.3f})')
-
-            axes[0].set_title('Difference between SIMFLUX and SMLM in X')
-            axes[0].set_xlabel('X position in FOV [nm]')
-            axes[0].set_ylabel('Difference [nm]')
-            axes[0].set_ylim(-60, 60)
-            #axes[0].set_ylim(-50, 50)
-            axes[1].scatter(sx * pos[indices, 1], sy * shift[indices, 1], s=3)
-            axes[1].plot(np.linspace(0, h) * sx, np.polyval(py, np.linspace(0, h)) * sy, 'g-')
-            axes[1].set_title(f'Y shift ({cy[0] * ky:.5f} rad/pixel), offset ({cy[1]:.3f}))')
-            axes[1].set_title('Difference between SIMFLUX and SMLM in Y')
-            axes[1].set_xlabel('Y position in FOV [nm]')
-            axes[1].set_ylabel('Difference [nm]')
-            axes[1].set_ylim(-60, 60)
-            #axes[1].set_xlim(2500, 3000)
-            #
-            axes[2].scatter(sz * pos[indices, 2], sz * shift[indices, 2], s=3)
-            axes[2].plot(np.linspace(-0.3, 0.3) * sz, np.polyval(pz, np.linspace(-0.5, 0.5)) * sz, 'g-')
-            axes[2].set_title(f'Z slope ({cz[0] * kz:.5f} rad/pixel), offset ({cz[1]:.3f})')
-
-            axes[2].set_title('Difference between SIMFLUX and SMLM in Z')
-            axes[2].set_xlabel('Z position in FOV [um]')
-            axes[2].set_ylabel('Difference [um]')
-
-            axes[2].set_ylim(-0.2, 0.2)
-            axes[2].set_xlim(-0.3, 0.3)
-            # axes[3].scatter(sx* pos[indices, 0], sz * pos[indices, 2], s=3)
-            # axes[3].plot(np.linspace(0, w) * sx, np.polyval(poszvsx, np.linspace(0, w)) , 'g-')
-            # axes[3].set_title(f'Z slope ({poszvsx[0] :.5f} rad/pixel), offset ({poszvsx[0]:.3f})')
-            #
-            # axes[3].set_title('Position Z based on SMLM as function of X')
-            # axes[3].set_xlabel('X position in FOV [nm]')
-            # axes[3].set_ylabel('Z [um]')
-
-            #axes[3].set_ylim(-0.5, 0.5)
-
-            fig.tight_layout()
-            fig.savefig(self.resultprefix +  "fov-shift" +tag+ ".png")
-
-        if False:
-            # plot a random subset of the points
-
-
-            np.random.seed(0)
-            indices = np.arange(len(pos))  # np.nonzero(np.min( self.IBg[:,:,0],1) > min_intensity)[0]
-            np.random.shuffle(indices)
-            indices = indices[:10000]
-
-            w, h = self.imgshape
-
-            fig, axes = plt.subplots(2, 1, figsize=[12, 12])
-            pxz = np.polyfit(pos[indices, 0], shift[indices, 0], 1)
-            pyz = np.polyfit(pos[indices, 1], shift[indices, 1], 1)
-
-            poszvsx = np.polyfit(pos[indices, 0], pos[indices, 2], 1)
-            sx = self.pixelsize
-            sy = self.pixelsize
-            sz = 1
-            kx, ky, kz = np.mean([self.mod[0][0][0], self.mod[1][0][0]]), np.mean(
-                [self.mod[0][0][1], self.mod[1][0][1]]), np.mean([self.mod[0][0][2], self.mod[1][0][2]])
-            axes[0].scatter(sx * pos[indices, 0], sz * shift[indices, 2], s=3)
-            axes[0].plot(np.linspace(0, w) * sx, np.polyval(pxz, np.linspace(0, w)) * 0.001, 'g-')
-            axes[0].set_title(f'X slope ({cx[0] * kx:.5f} rad/pixel), offset ({cx[1]:.3f})')
-
-            axes[0].set_title('Difference between SIMFLUX and SMLM in X of zbias')
-            axes[0].set_xlabel('X position in FOV [nm]')
-            axes[0].set_ylabel('Z Difference [um]')
-
-            # axes[0].set_ylim(-50, 50)
-            axes[1].scatter(sx * pos[indices, 1], sz * shift[indices, 2], s=3)
-            axes[1].plot(np.linspace(0, h) * sx, np.polyval(pyz, np.linspace(0, h)) * 0.001, 'g-')
-            axes[1].set_title(f'Y shift ({cy[0] * ky:.5f} rad/pixel), offset ({cy[1]:.3f}))')
-            axes[1].set_title('Difference between SIMFLUX and SMLM in Y of z bias')
-            axes[1].set_xlabel('Y position in FOV [nm]')
-            axes[1].set_ylabel('Difference of z [um]')
-            # axes[1].set_ylim(-50, 50)
-
-
-            # axes[3].scatter(sx* pos[indices, 0], sz * pos[indices, 2], s=3)
-            # axes[3].plot(np.linspace(0, w) * sx, np.polyval(poszvsx, np.linspace(0, w)) , 'g-')
-            # axes[3].set_title(f'Z slope ({poszvsx[0] :.5f} rad/pixel), offset ({poszvsx[0]:.3f})')
-            #
-            # axes[3].set_title('Position Z based on SMLM as function of X')
-            # axes[3].set_xlabel('X position in FOV [nm]')
-            # axes[3].set_ylabel('Z [um]')
-
-            # axes[3].set_ylim(-0.5, 0.5)
-
-            fig.tight_layout()
-            fig.savefig(self.resultprefix + "fov-shift" + tag + ".png")
-        flag = 0
-        if iter:
-            if pattern == 1:
-                loop_array = self.pattern_frames[0,:][...,None]
-            elif pattern == 2:
-                loop_array = self.pattern_frames[1,:][...,None]
-            else:
-                loop_array = self.pattern_frames
-            for ii in range(np.size(loop_array,0)):
-                patmod = loop_array[ii, :]
-
-                print(f"Adjust kx: {cx[0] * kx:.4f}, ky: {cy[0] * ky:.4f}, kz: {cz[0]*kz:.4f}. phase shift x: {cx[1] * kx:.4f}, phase shift y: {cy[1] * ky:.4f}, phase shift z: {cz[1]*kz:.4f}")
-                for jj in range(len(patmod)):
-
-
-                    self.mod[patmod[jj]][0][0] += cx[0] * self.mod[patmod[jj]][0][0]
-                    self.mod[patmod[jj]][0][1] += cy[0] * self.mod[patmod[jj]][0][1]
-                    # if self.mod[patmod[jj]][0][2] < 0:
-                    #     self.mod[patmod[jj]][0][2] -= 0.2*cz[0] * self.mod[patmod[jj]][0][2]
-                    # else:
-                    #     print('slope: ', cz[0],' mod: ' , self.mod[patmod[jj]][0][2])
-                    #     self.mod[patmod[jj]][0][2] += 0.2*cz[0] * self.mod[patmod[jj]][0][2]
-
-                    # self.mod[patmod[jj]][2] += cx[1] * self.mod[patmod[jj]][2]
-                    # self.mod[patmod[jj]][2] += cy[1] * self.mod[patmod[jj]][2]
-                    # self.mod[patmod[jj]][2] += cz[1] * self.mod[patmod[jj]][2]
-
-
-            if abs(cz[0] * self.mod[patmod[jj]][0][2]) < 0.005:
-                flag = 1
-        return cx[0],cy[0],cz[0]
-
-
-
-    def estimate_sigma(self, initialSigma=2, plot=True):
-
-        with Context(debugMode=self.debugMode) as ctx:
-            pos_estim = Gaussian(ctx).CreatePSF_XYIBg(self.roisize, initialSigma, True)
-            r = process_movie.localize_rois(self._summed_rois_iterator(), pos_estim, total=self.numrois)
-
-            sigma_estim = Gaussian(ctx).CreatePSF_XYIBgSigmaXY(self.roisize, initialSigma, True)
-
-            initial = np.zeros((self.numrois, 6))
-            initial[:,:4] = r.estim
-            initial[:,4:] = initialSigma
-
-            r = process_movie.localize_rois(self._summed_rois_iterator(), sigma_estim, initial_estim=initial)
-
-        if plot:
-            plt.figure()
-            plt.hist(r.estim [:,4], range=[1, 4],bins=200)
-            plt.title('Sigma X')
-
-            plt.figure()
-            plt.hist(r.estim[:,5], range=[1, 4],bins=200)
-            plt.title('Sigma Y')
-
-        best = np.median(r.estim [:,[4,5]],0)
-        print(f'Now using estimated sigma: {best}')
-
-        self.cfg['psf_calib'] = best
-        self.psf_calib = best
-        return best
 
     def view_rois(self, ids, indices=None, summed=False, fits=None):
         from photonpy.utils.ui.show_image import array_view
@@ -511,23 +229,21 @@ class SimfluxProcessor:
         return viewer
         """
 
-
-
-
     def load_all_rois(self):
         ri, pixels = process_movie.load_rois(self.rois_fn)
         return pixels
 
-    def gaussian_fitting(self, max_iter=500,  vectorfit=False,  max_iter_vec = 20, depth=0,check_pixels=False, alternative_load = False):
+    def spot_fitting(self, max_iter=500,  vectorfit=False,  max_iter_vec = 20, check_pixels=False, alternative_load = False):
         """
         Make sure self.IBg and self.sum_fits are known
         """
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '../vectorpsf')
+
         # region configure pupil
         import torch
         from vectorize_torch import  get_pupil_matrix
         from config import sim_params
-        paramsss = sim_params(depth)
+        paramsss = sim_params(self.depth)
         dev = 'cuda'
         zstack = False
         # region get values from paramsss
@@ -562,7 +278,7 @@ class SimfluxProcessor:
         sum_chisq = []
         sum_fit_vector = []
         traces_all = np.empty((max_iter_vec + 1, 0, 5))
-        print('2D Gaussian fitting...',flush=True)
+        print('Vectorial PSF fitting...',flush=True)
         with Context(debugMode=self.debugMode) as ctx:
             with self.create_psf(ctx, modulated=False) as psf, tqdm.tqdm(total=self.numrois) as pb:
 
@@ -606,12 +322,12 @@ class SimfluxProcessor:
                             e_vector, traces_vector, theta_min, theta_max, mu_est = self.gaussian_vector_2(
                                 torch.tensor(summed).to('cuda'), torch.tensor(e).to('cuda'),
                                 wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix, iter=max_iter_vec,
-                                depth=depth, check_pixels=True)
+                                depth=self.depth, check_pixels=True)
                         else:
                             e_vector, traces_vector, theta_min, theta_max = self.gaussian_vector_2(
                                 torch.tensor(summed).to('cuda'), torch.tensor(e).to('cuda'),
                                 wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix, iter=max_iter_vec,
-                                depth=depth)
+                                depth=self.depth)
 
                         iterations_vector = np.zeros(np.size(e_vector,0))
 
@@ -758,157 +474,20 @@ class SimfluxProcessor:
                                  max_iterations=max_iter)
             return sum_fit
 
-    def gaussian_fitting_zstack_vdec(self, pixels2,max_iter_vec = 40):
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
-        # region configure pupil
-        import torch
-        from vectorize_torch import poissonrate, get_pupil_matrix, initial_guess, thetalimits, compute_crlb, \
-            Model_vectorial_psf_simflux, Model_vectorial_psf, LM_MLE_simflux, LM_MLE
-
-        from config import sim_params
-        iterations_vector_tot = []
-
-        # fit the rois, get phase and mod, filter
-        spots_ = torch.tensor(pixels2.sum(1), device='cuda').type(torch.float)
-        params = sim_params(100, astig=0)
-        dev = 'cuda'
-        zstack = False
-        # region get values from params
-        NA = params.NA
-        refmed = params.refmed
-        refcov = params.refcov
-        refimm = params.refimm
-        refimmnom = params.refimmnom
-        Lambda = params.Lambda
-        Npupil = params.Npupil
-        abberations = torch.from_numpy(params.abberations).to(dev)
-        zvals = torch.from_numpy(params.zvals).to(dev)
-        zspread = torch.tensor(params.zspread).to(dev)
-        numparams = params.numparams
-        numparams_fit = 5
-        K = params.K
-        Mx = params.Mx
-        My = params.My
-        Mz = params.Mz
-
-        pixelsize = params.pixelsize
-        Ax = torch.tensor(params.Axmt).to(dev)
-        Bx = torch.tensor(params.Bxmt).to(dev)
-        Dx = torch.tensor(params.Dxmt).to(dev)
-        Ay = torch.tensor(params.Aymt).to(dev)
-        By = torch.tensor(params.Bymt).to(dev)
-        Dy = torch.tensor(params.Dymt).to(dev)
-
-        N = params.cztN
-        M = params.cztM
-        L = params.cztL
-
-        Nitermax = params.Nitermax
-        wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix = get_pupil_matrix(NA, zvals, refmed,
-                                                                                              refcov, refimm, refimmnom,
-                                                                                              Lambda,
-                                                                                              Npupil, abberations, dev)
-        thetamin, thetamax = thetalimits(abberations, Lambda, Mx, My, pixelsize, zspread, dev, zstack=False)
-
-        theta = initial_guess(spots_, dev).type(torch.float)
-        theta[:, 0:2] = (theta[:, [1, 0]] - Mx / 2) * pixelsize
-        theta[:, 2] = 0  # (theta[:, 2])*1000
-
-        thetaretry = theta * 1
-
-        param_range = torch.concat((thetamin[..., None], thetamax[..., None]), dim=1).type(torch.float)
-        model = Model_vectorial_psf()
-
-        mle = LM_MLE(model, lambda_=1e-6, iterations=40,
-                     param_range_min_max=param_range, tol=torch.tensor([1e-3, 1e-3, 1e-3, 1e-1, 1e-1]).to(dev))
-        mle = torch.jit.script(mle)
-
-        e_vector, traces_vector, _ = mle.forward(spots_, NA, zvals, refmed, refcov, refimm, refimmnom, Lambda, Npupil,
-                                              abberations,
-                                              0,
-                                              0, K, N,
-                                              M, L, Ax, Bx,
-                                              Dx, Ay, pixelsize, By, Dy, Mx, My, numparams_fit, theta, dev, zstack,
-                                              wavevector, wavevectorzimm, all_zernikes, PupilMatrix)
-        mu_est, dmu = poissonrate(NA, zvals, refmed, refcov, refimm, refimmnom, Lambda, Npupil, abberations, 0,
-                                    0, K, N,
-                                    M, L, Ax, Bx,
-                                    Dx, Ay, pixelsize, By, Dy, Mx, My, numparams_fit, e_vector, dev, False,
-                                    wavevector, wavevectorzimm, all_zernikes, PupilMatrix)
-
-        iterations_vector = np.zeros(np.size(e_vector, 0))
-        for loc in range(np.size(e_vector, 0)):
-            try:
-                iterations_vector[loc] = np.where(traces_vector[:, loc, 0] == 0)[0][0]
-            except:
-                iterations_vector[loc] = max_iter_vec
-        iterations_vector_tot.append(iterations_vector)
-
-        sh = pixels2.shape  # numspots, numpatterns, roisize, roisize
-        pixels_rs = pixels2.reshape((sh[0] * sh[1], sh[2], sh[3]))
-        e_vector = e_vector.detach().cpu().numpy()
-        params = np.repeat(e_vector, sh[1], axis=0)
-
-        params[:, -1] = 0
-        params[:, -2] = 1
-
-        ibg_vec = []
-        ibg_traces_vec = []
-        e_vector_ibg = np.repeat(e_vector, sh[1], axis=0)
-
-        # intial guess bg = mean outer pixels
-        temp_guess = np.mean(np.mean(pixels_rs[:, [0, int(self.roisize - 1)], :], axis=-1),
-                             axis=1)
-        e_vector_ibg[:, -1] = (temp_guess + np.mean(np.mean(pixels_rs[:, :, [0, int(self.roisize - 1)]], axis=-1),
-                                                    axis=1)) / 2
-
-        # fix bg at expeted value
-        # e_vector_ibg[:, -1] = np.repeat(e_vector[:,-1]/8, sh[1], axis=0)
-        e_vector_ibg[:, -2] = np.clip(
-            np.sum(np.sum(pixels_rs, axis=-1), axis=-1) - e_vector_ibg[:, -1] * self.roisize * self.roisize,
-            1, np.inf)
-        pixels_rs_split = np.array_split(pixels_rs, np.size(self.pattern_frames), axis=0)
-        e_vector_ibg_split = np.array_split(e_vector_ibg, np.size(self.pattern_frames), axis=0)
-
-        for split in range(np.size(self.pattern_frames)):
-            iterations_ibg = max_iter_vec * 1
-
-            temp1, temp2 = self.gaussian_vector_2_ibg_only(torch.tensor(pixels_rs_split[split]).to('cuda'),
-                                                           torch.tensor(e_vector_ibg_split[split]).to('cuda'),
-                                                           wavevector, wavevectorzimm, Waberration, all_zernikes,
-                                                           PupilMatrix, iter=iterations_ibg)
-            iterations_vector_ibg = np.zeros(np.size(temp1, 0))
-            for loc in range(np.size(temp1, 0)):
-
-                try:
-                    if iterations_vector_ibg[loc] < np.where(temp2[:, loc, 0] == 0)[0][0]:
-                        iterations_vector_ibg[loc] = np.where(temp2[:, loc, 0] == 0)[0][0]
-                except:
-                    iterations_vector_ibg[loc] = iterations_ibg
-            ibg_vec.append(temp1)
-            ibg_traces_vec.append(temp2)
-        ibg_vec = np.concatenate(ibg_vec)
-        ibg_traces_vec = np.concatenate(ibg_traces_vec)
-        ic = np.zeros((len(e_vector) * sh[1], 2))
-
-        ic[:, [0, 1]] = ibg_vec[:, 3:5]
-        ic = ic.reshape(int(np.size(ic,0)/np.size(self.pattern_frames)),np.size(self.pattern_frames),2)
-
-        return e_vector, ic, iterations_vector, mu_est.detach().cpu().numpy()
-
 
     def gaussian_fitting_zstack(self,pixels2, max_iter=500,  vectorfit=False,  max_iter_vec = 30, depth=0,check_pixels=False, roi_inf = 0):
         """
         Make sure self.IBg and self.sum_fits are known
         """
 
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '/vectorpsf')
         # region configure pupil
         import torch
         from vectorize_torch import  get_pupil_matrix
         from config import sim_params
 
         paramsss = sim_params(depth)
+
         dev = 'cuda'
         zstack = False
         # region get values from paramsss
@@ -943,7 +522,7 @@ class SimfluxProcessor:
         sum_chisq = []
         sum_fit_vector = []
         traces_all = np.empty((max_iter_vec + 1, 0, 5))
-        print('2D Gaussian fitting...',flush=True)
+        print('vectorial psf fitting...',flush=True)
         with Context(debugMode=self.debugMode) as ctx:
             with self.create_psf(ctx, modulated=False) as psf, tqdm.tqdm(total=self.numrois) as pb:
 
@@ -1037,7 +616,7 @@ class SimfluxProcessor:
 
                         for split in range(np.size(self.pattern_frames)):
                             iterations_ibg = max_iter_vec*1
-
+                            (e_vector_ibg_split[split])[:,2]=0+450 + -split*30
                             temp1, temp2 = self.gaussian_vector_2_ibg_only(torch.tensor(pixels_rs_split[split]).to('cuda'),
                                                                            torch.tensor(e_vector_ibg_split[split]).to('cuda'),
                                                                            wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix, iter = iterations_ibg)
@@ -1131,106 +710,10 @@ class SimfluxProcessor:
                                  max_iterations=max_iter)
             return sum_fit
 
-    def gaussian_fitting_vtorch(self,  calib, zrange = np.inf):
-        """
-        Make sure self.IBg and self.sum_fits are knownd
-        """
-
-        # import shit
-        from photonpy.simflux.torch_mle import gauss_psf_2D_astig, lm_mle, SIMFLUXModel, Gaussian2DAstigmaticPSF
-        import photonpy.cpp.gaussian as gaussian
-        import torch
-
-
-
-
-
-        rois_info = []
-        sum_fit = []
-        ibg = []
-        sum_crlb = []
-        sum_chisq = []
-
-        print('2D Gaussian torch fitting...',flush=True)
-
-        with Context(debugMode=self.debugMode) as ctx:
-            with self.create_psf(ctx, modulated=False) as psf, tqdm.tqdm(total=self.numrois) as pb:
-                dev = torch.device('cuda')
-
-
-                for ri, pixels in self._load_rois_iterator():
-
-                    summed = pixels.sum(1)
-                    fixed_sigma_psf = Gaussian(ctx).CreatePSF_XYIBg(self.roisize, 2, cuda=True)
-                    fixed_sigma_psf.SetLevMarParams(np.array([1e3, 1e3, 1e3, 1e3]), 300)
-
-                    xyIbg = fixed_sigma_psf.Estimate(summed)[0]
-
-                    guess = np.zeros((len(summed), 5))
-                    guess[:, [0, 1, 3, 4]] = xyIbg
-                    guess[:, 2] = 0
-                    param_range = np.array([
-                        [2, self.roisize - 3],
-                        [2, self.roisize - 3],
-                        [-3, 3],
-                        [1, 1e9],
-                        [0.5, 1000],
-                    ])
-
-                    guess = torch.from_numpy(guess).to(dev)
-                    summed = torch.from_numpy(summed).to(dev)
-                    param_range = torch.from_numpy(param_range).to(dev)
-
-                    model = lambda x: gauss_psf_2D_astig(x, self.roisize, [calib.x, calib.y])
-                    e = lm_mle(model, guess, summed, param_range, iterations=100, lambda_=0.01).cpu().numpy()
-                    # psf.ChiSquare()
-                    sum_crlb.append(np.zeros(np.shape(e)))
-                    sum_chisq.append(np.zeros(np.size(e,1)))
-
-                    rois_info.append(ri)
-
-                    sh = pixels.shape # numspots, numpatterns, roisize, roisize
-                    pixels_rs = pixels.reshape((sh[0]*sh[1],sh[2],sh[3]))
-                    params = np.repeat(e, sh[1], axis=0)
-                    params[:,-2] = 1
-                    params[:,-1] = 0
-
-
-                    ibg_, ibg_crlb_ = psf.EstimateIntensityAndBackground(params, pixels_rs, cuda=True)
-
-                    ic = np.zeros((len(e)*sh[1],4))
-                    ic [:,[0,1]] = ibg_
-                    ic [:,[2,3]] = ibg_crlb_
-                    ibg.append(ic.reshape((sh[0],sh[1],4)))
-
-                    sum_fit.append(e)
-
-                    pb.update(len(pixels))
-
-                param_names = psf.param_names
-        print(flush=True)
-
-        sum_fit = np.concatenate(sum_fit)
-
-        indices = np.ones(np.shape(sum_fit)[0]) == 1
-        sum_fit = sum_fit[indices]
-        IBg = np.concatenate(ibg)[indices]
-
-        #sum_chisq = np.concatenate(sum_chisq)[indices]
-        sum_chisq =np.zeros(np.shape(indices))
-        sum_crlb = np.zeros(np.shape(indices))
-        #sum_crlb = np.concatenate(sum_crlb)[indices]
-        rois_info = np.concatenate(rois_info)[indices]
-        sum_crlb = None
-        sum_chisq=np.ones(np.size(IBg,0))
-        self.chisq_threshold = 0
-        self._store_IBg_fits(sum_fit, IBg, sum_chisq, sum_crlb, rois_info, param_names,np.ones(np.size(IBg,0)), zrange)
-
-
     def gaussian_vector_2(self,  summed, guess, wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix,iter=40, depth=0, check_pixels=False):
         import sys
         # caution: path[0] is reserved for script path (or '' in REPL)
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '/vectorpsf')
 
         import torch
         from vectorize_torch import poissonrate, get_pupil_matrix, initial_guess, thetalimits, compute_crlb, \
@@ -1303,7 +786,7 @@ class SimfluxProcessor:
     def gaussian_vector_2_ibg_only(self,  summed, guess, wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix,iter=15):
         import sys
         # caution: path[0] is reserved for script path (or '' in REPL)
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '/vectorpsf')
 
         import torch
         from vectorize_torch import poissonrate, get_pupil_matrix, initial_guess, thetalimits, compute_crlb, \
@@ -1367,7 +850,7 @@ class SimfluxProcessor:
     def gaussian_vector_2_simflux(self, lamda = 0.01,iter=40, pick_percentage=1, pattern=0, depth=0):
         import sys
         # caution: path[0] is reserved for script path (or '' in REPL)
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '/vectorpsf')
 
         import torch
         from vectorize_torch import poissonrate, get_pupil_matrix, initial_guess, thetalimits, compute_crlb, \
@@ -1411,7 +894,10 @@ class SimfluxProcessor:
         thetamin, thetamax = thetalimits(abberations, Lambda, Mx, My, pixelsize, zspread, dev, zstack=False)
         param_range = torch.concat((thetamin[..., None], thetamax[..., None]), dim=1)
 
-
+        # change for Zimflux estimator
+        self.sum_ds.local_pos[:, 2] = -1 * self.sum_ds.local_pos[:, 2]
+        self.sum_ds.pos[:, 2] = -1 * self.sum_ds.pos[:, 2]
+        self.set_kz([-self.mod[0][0][2]])
         model = Model_vectorial_psf_simflux(self.roisize)
         mle = LM_MLE_simflux(model, lambda_=lamda, iterations=iter,
                      param_range_min_max=param_range, tol=torch.tensor(([1e-3,1e-3,1e-5,1e-2,1e-2])).to(dev))
@@ -1552,221 +1038,17 @@ class SimfluxProcessor:
         #for visual
         #ds.pos[: , 2]= -ds.pos[: , 2]
         #self.sum_ds_filtered.pos[: , 2] = -self.sum_ds_filtered.pos[: , 2]
-        self.sf_ds = ds
-        self.sf_ds.save(self.resultprefix + "simflux" + ".hdf5")
+        self.zf_ds = ds
+        self.zf_ds.save(self.resultprefix + "simflux" + ".hdf5")
         self.sum_ds_filtered.save(self.resultprefix + "g2d-filtered" + ".hdf5")
 
+        self.sum_ds_filtered.local_pos[:, 2] = -1 * self.sum_ds_filtered.local_pos[:, 2]
+        self.sum_ds_filtered.pos[:, 2] = -1 * self.sum_ds_filtered.pos[:, 2]
 
         return e, traces_all, iterations_vector_tot
 
 
-    def gaussian_vector(self, zrange=np.inf, iter=40):
-        """
-        Make sure self.IBg and self.sum_fits are known
-        """
 
-        # import shit
-        import sys
-        # caution: path[0] is reserved for script path (or '' in REPL)
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
-
-        import torch
-        from vectorize_torch import poissonrate, get_pupil_matrix, initial_guess, thetalimits, compute_crlb, \
-            Model_vectorial_psf, LM_MLE
-        from config import sim_params
-        rois_info = []
-        sum_fit = []
-        traces_all = np.empty((iter+1,0,5))
-        ibg = []
-        sum_crlb = []
-        sum_chisq = []
-
-        print('2D Gaussian torch fitting...', flush=True)
-
-        with Context(debugMode=self.debugMode) as ctx:
-
-
-            with self.create_psf(ctx, modulated=False) as psf, tqdm.tqdm(total=self.numrois) as pb:
-                dev = torch.device('cuda')
-                for ri, pixels in self._load_rois_iterator():
-
-
-                    paramsss = sim_params()
-                    dev = 'cuda'
-                    zstack = False
-                    # region get values from paramsss
-                    NA = paramsss.NA
-                    refmed = paramsss.refmed
-                    refcov = paramsss.refcov
-                    refimm = paramsss.refimm
-                    refimmnom = paramsss.refimmnom
-                    Lambda = paramsss.Lambda
-                    Npupil = paramsss.Npupil
-                    abberations = torch.from_numpy(paramsss.abberations).to(dev)
-                    zvals = torch.from_numpy(paramsss.zvals).to(dev)
-                    zspread = torch.tensor(paramsss.zspread).to(dev)
-                    numparams = paramsss.numparams
-                    numparams_fit = 5
-                    K = paramsss.K
-                    Mx = paramsss.Mx
-                    My = paramsss.My
-                    Mz = paramsss.Mz
-
-                    pixelsize = paramsss.pixelsize
-                    Ax = torch.tensor(paramsss.Axmt).to(dev)
-                    Bx = torch.tensor(paramsss.Bxmt).to(dev)
-                    Dx = torch.tensor(paramsss.Dxmt).to(dev)
-                    Ay = torch.tensor(paramsss.Aymt).to(dev)
-                    By = torch.tensor(paramsss.Bymt).to(dev)
-                    Dy = torch.tensor(paramsss.Dymt).to(dev)
-
-                    N = paramsss.cztN
-                    M = paramsss.cztM
-                    L = paramsss.cztL
-
-                    summed = pixels.sum(1)
-                    fixed_sigma_psf = Gaussian(ctx).CreatePSF_XYIBg(self.roisize, 2, cuda=True)
-                    fixed_sigma_psf.SetLevMarParams(np.array([1e3, 1e3, 1e3, 1e3]), 300)
-
-                    xyIbg = fixed_sigma_psf.Estimate(summed)[0]
-
-                    guess = np.zeros((len(summed), 5))
-                    guess[:, [0, 1, 3, 4]] = xyIbg
-                    guess[:, 2] = 0
-                    param_range = np.array([
-                        [2, self.roisize - 3],
-                        [2, self.roisize - 3],
-                        [-3, 3],
-                        [1, 1e9],
-                        [0.5, 1000],
-                    ])
-
-                    guess = torch.from_numpy(guess).to(dev)
-                    summed = torch.from_numpy(summed).to(dev)
-                    param_range = torch.from_numpy(param_range).to(dev)
-                    thetamin, thetamax = thetalimits(abberations, Lambda, Mx, My, pixelsize, zspread, dev, zstack=False)
-                    param_range = torch.concat((thetamin[..., None], thetamax[..., None]), dim=1)
-
-                    guess[:, 0:2] = (guess[:, 0:2] - self.roisize / 2) * pixelsize
-
-                    model = Model_vectorial_psf()
-                    mle = LM_MLE(model, lambda_=1e-1, iterations=iter,
-                                 param_range_min_max=param_range, tol=1e-3)
-                    mle = torch.jit.script(mle)
-                    wavevector, wavevectorzimm, Waberration, all_zernikes, PupilMatrix = get_pupil_matrix(NA, zvals,
-                                                                                                          refmed,
-                                                                                                          refcov,
-                                                                                                          refimm,
-                                                                                                          refimmnom,
-                                                                                                          Lambda,
-                                                                                                          Npupil,
-                                                                                                          abberations,
-                                                                                                           dev)
-                    e, traces, _ = mle.forward(summed, NA, zvals, refmed, refcov, refimm, refimmnom, Lambda,
-                                                      Npupil, abberations, 0,
-                                                      0, K, N,
-                                                      M, L, Ax, Bx,
-                                                      Dx, Ay, pixelsize, By, Dy, Mx, My, numparams_fit, guess, dev,
-                                                      zstack,
-                                                      wavevector, wavevectorzimm, all_zernikes, PupilMatrix)
-                    e = e.detach().cpu().numpy()
-                    traces = traces.detach().cpu().numpy()
-                    # psf.ChiSquare()
-                    sum_crlb.append(np.zeros(np.shape(e)))
-                    sum_chisq.append(np.zeros(np.size(e, 1)))
-
-                    rois_info.append(ri)
-
-                    sh = pixels.shape  # numspots, numpatterns, roisize, roisize
-                    pixels_rs = pixels.reshape((sh[0] * sh[1], sh[2], sh[3]))
-
-
-
-                    sum_fit.append(e)
-                    traces_all = np.concatenate((traces_all,traces), axis =1)
-
-                    pb.update(len(pixels))
-
-            param_names = psf.param_names
-
-
-        sum_fit = np.concatenate(sum_fit)
-
-        return sum_fit, traces_all
-
-    def fix_rois_laeteral(self, rois_ori):
-
-        newrois = rois_ori[rois_ori['id'] == 0]
-
-        maxframes = np.floor(read_tiff.tiff_get_movie_size(self.src_fn)[1] / np.size(self.pattern_frames))
-        for i in np.arange(1, maxframes):
-            insert_array = rois_ori[rois_ori['id'] == 0]
-            insert_array['id'] = i
-            newrois = np.hstack((insert_array, newrois))
-
-        def save_rois_vp(f, rois_info, pixels):
-            np.save(f[:-4] + 'info.npy', rois_info)
-            np.save(f[:-4] + 'pixels.npy', pixels)
-            self.numrois = len(rois_info)
-
-        # create roi in format
-        image = read_tiff.tiff_read_all(self.src_fn)[0:int(maxframes * np.size(self.pattern_frames))]
-        image2 = np.reshape(image, (
-            int(maxframes), np.size(self.pattern_frames), np.size(image, 1),
-            np.size(image, 2)))
-        pxstack = np.zeros([len(newrois), np.size(self.pattern_frames), self.roisize, self.roisize])
-        pxstack_summedpat1 = np.zeros(
-            [len(rois_ori), int(np.size(self.pattern_frames) / len(self.pattern_frames)), self.roisize, self.roisize])
-
-        for jj in range(len(newrois)):
-            frame = newrois['id'][jj]
-            x = newrois['x'][jj]
-            y = newrois['y'][jj]
-            pxstack[jj, :, :, :] = image2[frame, :, y:(y + self.roisize), x:(x + self.roisize)]
-            pxstack_summedpat1[None,jj % len(rois_ori), :, :, :] += image2[frame, self.pattern_frames[0],
-                                                               y:(y + self.roisize), x:(x + self.roisize)]
-
-
-        staticroi = np.tile(np.arange(len(rois_ori) - 1, -1, -1), int(np.size(image, 0) / np.size(self.pattern_frames)))
-        save_rois_vp(self.rois_fn, newrois, pxstack)
-
-        return staticroi, pxstack, newrois, (pxstack_summedpat1 / len(rois_ori) - 100) * 0.4
-
-    def fix_rois_through_frames(self, rois_ori):
-
-        newrois = rois_ori[rois_ori['id'] == 0]
-
-        maxframes = np.floor(read_tiff.tiff_get_movie_size(self.src_fn)[1] / np.size(self.pattern_frames))
-        for i in np.arange(1, maxframes):
-            insert_array = rois_ori[rois_ori['id'] == 0]
-            insert_array['id'] = i
-            newrois = np.hstack((insert_array, newrois))
-
-        def save_rois_vp(f, rois_info, pixels):
-            np.save(f[:-4] + 'info.npy', rois_info)
-            np.save(f[:-4] + 'pixels.npy', pixels)
-            self.numrois = len(rois_info)
-
-        # create roi in format
-        image = read_tiff.tiff_read_all(self.src_fn)[0:int(maxframes*np.size(self.pattern_frames))]
-        image2 = np.reshape(image, (
-        int(maxframes), np.size(self.pattern_frames), np.size(image, 1),
-        np.size(image, 2)))
-        pxstack = np.zeros([len(newrois), np.size(self.pattern_frames), self.roisize, self.roisize])
-        pxstack_summedpat1 = np.zeros([len(rois_ori), int(np.size(self.pattern_frames)/len(self.pattern_frames)), self.roisize, self.roisize])
-        pxstack_summedpat2 = np.zeros([len(rois_ori), int(np.size(self.pattern_frames)/len(self.pattern_frames)), self.roisize, self.roisize])
-        for jj in range(len(newrois)):
-            frame = newrois['id'][jj]
-            x = newrois['x'][jj]
-            y = newrois['y'][jj]
-            pxstack[jj, :, :, :] = image2[frame, :, y:(y + self.roisize), x:(x + self.roisize)]
-            pxstack_summedpat1[jj%len(rois_ori),:,:,:] +=image2[frame, self.pattern_frames[0], y:(y + self.roisize), x:(x + self.roisize)]
-            pxstack_summedpat2[jj%len(rois_ori),:,:,:] +=image2[frame, self.pattern_frames[1], y:(y + self.roisize), x:(x + self.roisize)]
-
-        staticroi = np.tile(np.arange(len(rois_ori) - 1, -1, -1), int(np.size(image, 0) / np.size(self.pattern_frames)))
-        save_rois_vp(self.rois_fn, newrois, pxstack)
-
-        return staticroi, pxstack, newrois, (pxstack_summedpat1/len(rois_ori)-100)*0.4, (pxstack_summedpat2/len(rois_ori)-100)*0.4
 
     def _store_IBg_fits_vector(self, sum_fit, ibg, sum_chisq, sum_crlb, rois_info,psf_param_names, iterations, iterations_ibg,theta_min, theta_max, max_iterations=500, torchv = False):
         """
@@ -1987,67 +1269,6 @@ class SimfluxProcessor:
     def report_pattern(self):
         ...
 
-    def estimate_kz(self, kz0_range, kz1_range, initial_filter, numpoints=10):
-
-        kz0 = np.linspace(kz0_range[0], kz0_range[1], numpoints)
-        kz1 = np.linspace(kz1_range[0], kz1_range[1], numpoints)
-        mean_depth_pat0 = np.zeros(np.shape(kz0))
-        mean_depth_pat1 = np.zeros(np.shape(kz0))
-        mean_error_pat0 = np.zeros(np.shape(kz0))
-        mean_error_pat1 = np.zeros(np.shape(kz1))
-
-        for i in range(len(kz0)):
-            k_iter = kz0[i]
-            self.estimate_patterns_iter(first_iteration=True, kz=np.array([k_iter, 5.05]))
-            self.estimate_phases(num_phase_bins=10, iterations=10, accept_percentile=100)
-            errpat0, _ = self.compute_mean_moderr(initial_filter)
-            mean_error_pat0[i] = np.mean(errpat0)
-            mean_depth_pat0[i] = np.mean(self.mod['depth'][self.pattern_frames[0]])
-        for i in range(len(kz1)):
-            k_iter = kz1[i]
-            self.estimate_patterns_iter(first_iteration=True, kz=np.array([5.05, k_iter]))
-            self.estimate_phases(num_phase_bins=10, iterations=10, accept_percentile=100)
-            _, errpat1 = self.compute_mean_moderr(initial_filter)
-            mean_error_pat1[i] = np.mean(errpat1)
-            mean_depth_pat1[i] = np.mean(self.mod['depth'][self.pattern_frames[1]])
-        plt.figure()
-        plt.scatter(kz0, mean_error_pat0, label='data')
-
-        p = np.polyfit(kz0, mean_error_pat0, 4)
-        plt.plot(np.linspace(min(kz0), max(kz0), 100), np.polyval(p, np.linspace(min(kz0), max(kz0), 100)), color='red',
-                 linewidth=1, label='4th order polynomial')
-
-        # plt.vlines(5.05, min(mean_error_pat1)-0.05*max(mean_error_pat1), max(mean_error_pat1), 'red')
-        plt.xlabel('kz0')
-        plt.ylabel('Mean modulation error for direction 0 [(I_exp - I_found)/I_tot]')
-        plt.title('kz = [ kz0, _ ]')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        minima = np.roots(np.polyder(p))
-        minimumkz0 = minima[np.argmin(np.polyval(p, minima))]
-
-        plt.figure()
-        plt.scatter(kz1, mean_error_pat1, label='data')
-
-        p = np.polyfit(kz1, mean_error_pat1, 4)
-        plt.plot(np.linspace(min(kz1), max(kz1), 100), np.polyval(p, np.linspace(min(kz1), max(kz1), 100)), color='red',
-                 linewidth=1, label='4th order polynomial')
-
-        # plt.vlines(5.05, min(mean_error_pat1)-0.05*max(mean_error_pat1), max(mean_error_pat1), 'red')
-        plt.xlabel('kz1')
-        plt.ylabel('Mean modulation error for direction 1 [(I_exp - I_found)/I_tot]')
-        plt.title('kz = [ _ , kz1]')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        minima = np.roots(np.polyder(p))
-        minimumkz1 = minima[np.argmin(np.polyval(p, minima))]
-
-        return minimumkz0, minimumkz1,  mean_depth_pat0, mean_depth_pat1
-
     def set_kz(self, k_patz):
         for ii in range(np.size(self.pattern_frames, 0)):
             patmod = self.pattern_frames[ii, :]
@@ -2065,70 +1286,6 @@ class SimfluxProcessor:
             patmod = self.pattern_frames[ii, :]
             for jj in range(len(patmod)):
                 self.mod[patmod[jj]][0][1] = k_patz[ii]
-
-    def estimate_kz_depth(self, kz0_range, kz1_range, initial_filter, numpoints=10):
-
-        kz0 = np.linspace(kz0_range[0], kz0_range[1], numpoints)
-        kz1 = np.linspace(kz1_range[0], kz1_range[1], numpoints)
-        mean_depth_pat0 = np.zeros(np.shape(kz0))
-        mean_depth_pat1 = np.zeros(np.shape(kz0))
-        mean_error_pat0 = np.zeros(np.shape(kz0))
-        mean_error_pat1 = np.zeros(np.shape(kz1))
-
-        for i in range(len(kz0)):
-            k_iter = kz0[i]
-            self.set_kz([k_iter, 4.5])
-            self.estimate_phases(num_phase_bins=10, iterations=5, accept_percentile=100)
-            errpat0, _ = self.compute_mean_moderr(initial_filter)
-            mean_error_pat0[i] = np.mean(errpat0)
-            mean_depth_pat0[i] = np.mean(self.mod['depth'][self.pattern_frames[0]])
-        for i in range(len(kz1)):
-            k_iter = kz1[i]
-            self.set_kz([ 4.5, k_iter])
-
-            self.estimate_phases(num_phase_bins=10, iterations=5, accept_percentile=100)
-            _, errpat1 = self.compute_mean_moderr(initial_filter)
-            mean_error_pat1[i] = np.mean(errpat1)
-            mean_depth_pat1[i] = np.mean(self.mod['depth'][self.pattern_frames[1]])
-        plt.figure()
-        plt.scatter(kz0, mean_error_pat0, label='data')
-
-        p = np.polyfit(kz0, mean_error_pat0, 5)
-        fig1 = plt.plot(np.linspace(min(kz0), max(kz0), 100), np.polyval(p, np.linspace(min(kz0), max(kz0), 100)), color='red',
-                 linewidth=1, label='4th order polynomial')
-
-        #plt.vlines(5.05, min(mean_depth_pat0)-0.05*max(mean_depth_pat0), max(mean_depth_pat0), 'red')
-        plt.xlabel('kz0')
-        plt.ylabel('Mean modulation error for direction 0 ')
-        plt.title('kz = [ kz0, _ ]')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        minima = np.roots(np.polyder(p))
-        minima = np.real(minima)
-        minimumkz0 = minima[np.argmin(np.polyval(p, minima))]
-
-        fig2 = plt.figure()
-        plt.scatter(kz1, mean_error_pat1, label='data')
-
-        p = np.polyfit(kz1, mean_error_pat1, 5)
-        plt.plot(np.linspace(min(kz1), max(kz1), 100), np.polyval(p, np.linspace(min(kz1), max(kz1), 100)), color='red',
-                 linewidth=1, label='4th order polynomial')
-
-        #plt.vlines(5.05, min(mean_depth_pat1)-0.05*max(mean_depth_pat1), max(mean_depth_pat1), 'red')
-        plt.xlabel('kz1')
-        plt.ylabel('Mean modulation error for direction 1 ')
-        plt.title('kz = [ _ , kz1]')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        minima = np.roots(np.polyder(p))
-        minima = np.real(minima)
-        minimumkz1 = minima[np.argmin(np.polyval(p, minima))]
-
-        return minimumkz0, minimumkz1,  mean_depth_pat0, mean_depth_pat1, [fig1, fig2]
 
     def estimate_phases(self, num_phase_bins=10,
                           fix_phase_shifts=None,
@@ -2151,7 +1308,7 @@ class SimfluxProcessor:
         phase, depth, power = self.spotlist.estimate_phase_and_depth(k, self.pattern_frames, frame_bins,
                                                                      percentile=accept_percentile,
                                                                      iterations=iterations)
-        
+
         phase_all, depth_all, power_all = self.spotlist.estimate_phase_and_depth(k, self.pattern_frames, [fr],
                                                                                  percentile=accept_percentile,
                                                                                  iterations=iterations)
@@ -2251,11 +1408,6 @@ class SimfluxProcessor:
         depth = self.mod[np.argmin(self.mod['relint'])]['depth']
         median_intensity_at_zero = med_sum_I * lowest_power * (1-depth)
         self.report(f"Median summed intensity: {med_sum_I:.1f}. Median intensity at pattern zero: {median_intensity_at_zero:.1f}")
-
-    # def set_beam_angle(self, beamAngle):
-    #     wavelen = self.cfg['wavelength']
-    #     kz = 2*np.pi/wavelen *np.cos(beamAngle) * 1000 # rad/um
-    #     self.mod['k'][:,2] = kz
 
 
     def draw_pattern(self):
@@ -2390,7 +1542,7 @@ class SimfluxProcessor:
         dims = theta.shape[1]-1
         intensity = theta[:,-1]
         pos = theta[:,:dims]
-        
+
         k = mod['k']
         phaseshift = mod['phase']
         depth = mod['depth']
@@ -2444,169 +1596,54 @@ class SimfluxProcessor:
         moderr = self.compute_moderr()
         return np.nonzero(moderr < moderror_threshold)[0], moderr
 
-    def process(self, fn_idx=0, maxiter= 500, filter_spots = True, zrange=np.inf):
+
+    def refine_kz(self, initial_value=13.3, num_iterations_refined=20, lamda=1e-5, plot=True):
+        self.set_kz([initial_value])
+        self.estimate_phases(10, iterations=5)
+        self.moderror_threshold = 0.3
+        # self.draw_patterns(dims=3)
+        if plot:
+            plt.show()
+            plt.close('all')
+        slope_array = np.zeros(num_iterations_refined + 1)
+        slope_array[0] = initial_value
+        for iteration in range(num_iterations_refined):
+            plt.close('all')
+            self.estimate_phases(10, iterations=3)
+            plt.close('all')
+            traces_simflux = self.process_torch(calib=0, only_illu=True, lamda=lamda,
+                                                vector=False, pick_percentage=1, pattern=0)
+            plot_data = self.cluster_picassopicks()
+            print(-plot_data[0] * self.mod[0][0][2])
+            self.set_kz([-plot_data[0] * self.mod[0][0][2] + self.mod[0][0][2]])
+            slope_array[iteration + 1] = self.mod[0][0][2]
+            print(self.mod[0][0][2])
+
+        cm = 1 / 2.54
+        fontProperties = {'family': 'sans-serif', 'sans-serif': ['Helvetica'],
+                          'weight': 'normal', 'size': 12}
+        if plot:
+            plt.figure(figsize=(8 * cm, 6 * cm))
+            plt.scatter(np.arange(num_iterations_refined + 1), 2 * np.pi / slope_array * 1000)
+            # spl = scipy.interpolate.UnivariateSpline(np.arange(num_iterations_refined + 1),
+            #                                          2 * np.pi / slope_array * 1000, s=30)
+            # plt.plot(np.linspace(0, num_iterations_refined + 1, 100),
+            #          spl(np.linspace(0, num_iterations_refined + 1, 100)))
+            plt.ylabel(r'Axial pitch $p_{ax}$ [nm]')
+            plt.xlabel('Iteration')
+            plt.tight_layout(pad=0.2)
+            plt.show()
+        return
+
+    def process_torch(self, calib, fn_idx=0, only_illu=False, lamda=1, vector=True, pick_percentage=1, pattern=0):
         """
-        Perform SIMFLUX localization
-        """
-
-        with Context(debugMode=self.debugMode) as ctx:
-
-            #if len(self.pattern_frames)==2: # assume XY modulation
-            #    self.draw_mod()
-
-            indices, moderr = self.filter_spots(self.moderror_threshold)
-
-
-            print(f"# filtered spots left: {len(indices)}. median moderr:{np.median(moderr):.2f}")
-
-            mod_ = self.mod_at_frame(self.sum_ds.frame)
-
-            psf = self.create_psf(ctx, modulated=True)
-            try:
-                params = self.levmarparams_sf
-            except:
-                raise NameError('Define sp.levmarparams_astig')
-
-            psf.SetLevMarParams(params, maxiter, normalizeWeights=True)
-            dims = psf.numparams-2
-
-            print(f"Constants per ROI: {psf.numconst}")
-            
-            indices_org = indices*1
-            testmask = np.zeros(len(self.sum_ds),dtype=np.bool)
-
-            with EstimQueue(psf, batchSize=2048, numStreams=1, keepSamples=False) as queue:
-                idx = 0
-                for roipos, pixels, block_indices in self.selected_roi_source(indices):
-
-                    roi_mod = mod_[block_indices]
-#
-                    roi_mod_float = np.reshape(roi_mod.view(np.float32), (len(roi_mod), 6*len(self.mod)))
-
-                    initial = np.zeros((len(block_indices), psf.numparams))
-                    initial[:,:dims] = self.sum_ds.local_pos[block_indices]
-                    initial[:,-1] = self.sum_ds.background[block_indices]/len(self.mod)
-                    initial[:,-2] = self.sum_ds.photons[block_indices]
-                    
-                    testmask[block_indices] = True
-
-                    queue.Schedule(pixels, roipos=roipos,initial=initial,
-                                   constants=roi_mod_float, ids=np.arange(len(roipos))+idx)
-                    idx += len(roipos)
-
-                queue.WaitUntilDone()
-                qr = queue.GetResults()
-                
-            assert testmask.sum() == len(indices_org)
-
-            qr.SortByID(isUnique=True)
-
-
-            qr.ids = self.sum_ds.frame[indices]
-            ds = Dataset.fromQueueResults(qr, self.imgshape)
-
-            if filter_spots:
-                print(f'Filtering on iterations: { (ds.iterations>maxiter).sum() }/{len(ds)} spots removed. Max iterations={maxiter}')
-
-                indices = indices[ds.iterations < maxiter]
-
-                ds = ds[ds.iterations < maxiter]
-                # indices = indices[ds.photons > 2000]
-                # ds = ds[ds.photons > 2000]
-                border = 2.1
-                sel = ((ds.local_pos[:,0] > border) & (ds.local_pos[:,0] < self.roisize-border-1) &
-                    (ds.local_pos[:,1] > border) & (ds.local_pos[:,1] < self.roisize-border-1) &
-                       (ds.local_pos[:,2] > -zrange) & (ds.local_pos[:,2] < zrange))
-
-                print(f'Filtering on position in ROI: {len(ds)-sel.sum()}/{len(ds)} spots removed.')
-                ds = ds[sel]
-                indices = indices[sel]
-            
-            self.sf_ds = ds
-            self.sum_ds_filtered = self.sum_ds[indices]
-
-            self.sf_ds.save(self.resultprefix+"simflux"+str(fn_idx)+".hdf5")
-            self.sum_ds_filtered.save(self.resultprefix+"g2d-filtered"+str(fn_idx)+".hdf5")
-
-
-    def simflux_estimator_vector(self):
-
-        """
-        Perform SIMFLUX localization
+        Perform ZIMFlux localization
         """
         from photonpy.simflux.torch_mle import gauss_psf_2D_astig, lm_mle, ModulatedIntensitiesModel, \
             Gaussian2DAstigmaticPSF, SIMFLUXModel, SIMFLUXModel_vector
         import photonpy.smlm.process_movie as process_movie
         import torch
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
-
-        import torch
-        from vectorize_torch import LM_MLE
-
-        from torch import Tensor
-
-        with Context(debugMode=False) as ctx:
-            # if len(self.pattern_frames)==2: # assume XY modulation
-            #    self.draw_mod()
-
-            indices, moderr = self.filter_spots(self.moderror_threshold)
-
-            numblocks = np.ceil(len(indices) / 100)
-            block_indices = np.array_split(indices, numblocks)
-            print(f"# filtered spots left: {len(indices)}. median moderr:{np.median(moderr):.2f}")
-            estimation = np.empty((0, 5))
-
-            mod = self.mod_at_frame(self.sum_ds.frame)
-
-            print('\n Perform Simflux localization via pytorch... ')
-
-            for blocks in tqdm.trange(1):  # ))int(numblocks)): # int(numblocks
-                indices_single = block_indices[blocks]
-                mod_single = mod[indices_single, :]
-                mod_torch = np.zeros([len(indices_single), 8, 6])
-
-                for i in range(np.size(mod_torch, 0)):
-                    for j in range(8):
-                        mod_torch[i, j, 0:3] = mod_single[i, j][0]
-                        mod_torch[i, j, 3] = mod_single[i, j][1]
-                        mod_torch[i, j, 4] = mod_single[i, j][2]
-                        mod_torch[i, j, 5] = mod_single[i, j][3]
-                roi_idx = self.sum_ds.roi_id[indices_single]
-
-                roi_info, pixels = process_movie.load_rois(self.rois_fn)
-                pixels = pixels[roi_idx]
-                roi_pos = np.vstack((roi_info['x'], roi_info['y'])).T
-                roi_pos = roi_pos[roi_idx, :]
-                with torch.no_grad():
-                    dev = torch.device('cuda')
-
-                    smp_ = torch.from_numpy(pixels).to(dev)  # summed for modulated model
-                    mod_ = torch.from_numpy(np.asarray(mod_torch)).to(dev)
-
-                    initial = np.zeros([len(indices_single), 5])
-                    dims = 3
-                    initial[:, :dims] = self.sum_ds.local_pos[indices_single]
-                    initial[:, -1] = self.sum_ds.background[
-                                         indices_single] / 8  # divide by numpat?????????????????????????????????????
-                    if only_illu:
-                        initial[:, -1] = initial[:, -1] * 16 * 16
-                    initial[:, -2] = self.sum_ds.photons[indices_single]
-
-                    initial_ = torch.from_numpy(initial).to(dev)
-
-                    psf_model = Gaussian2DAstigmaticPSF(self.roisize, [calib.x, calib.y])
-                    roi_pos_ = torch.from_numpy(roi_pos).to(dev)
-
-
-
-    def process_torch(self, calib, fn_idx=0, only_illu= False, lamda = 1, vector=True, pick_percentage=1, pattern = 0):
-        """
-        Perform SIMFLUX localization
-        """
-        from photonpy.simflux.torch_mle import gauss_psf_2D_astig, lm_mle, ModulatedIntensitiesModel, Gaussian2DAstigmaticPSF, SIMFLUXModel, SIMFLUXModel_vector
-        import photonpy.smlm.process_movie as process_movie
-        import torch
-        sys.path.insert(1, 'C:/Development/simflux3d/projects/vectorpsf')
+        sys.path.insert(1, '/vectorpsf')
 
         import torch
         from vectorize_torch import LM_MLE_simflux
@@ -2618,70 +1655,69 @@ class SimfluxProcessor:
             #    self.draw_mod()
 
             indices, moderr = self.filter_spots(self.moderror_threshold)
-            select = np.random.choice(np.arange(indices.size),size=int(len(indices)*pick_percentage), replace=False)
+            select = np.random.choice(np.arange(indices.size), size=int(len(indices) * pick_percentage), replace=False)
             indices = indices[select]
             moderr = moderr[select]
             numblocks = np.ceil(len(indices) / 80000)
             block_indices = np.array_split(indices, numblocks)
             print(f"# filtered spots left: {len(indices)}. median moderr:{np.median(moderr):.2f}")
-            estimation = np.empty((0,5))
+            estimation = np.empty((0, 5))
 
             mod = self.mod_at_frame(self.sum_ds.frame)
 
-            print('\n Perform Simflux localization via pytorch... ')
+            print('\n Perform ZIMFLUX only using illumination via pytorch... ')
 
-            for blocks in tqdm.trange(int(numblocks)): # int(numblocks
+            for blocks in tqdm.trange(int(numblocks)):  # int(numblocks
                 indices_single = block_indices[blocks]
-                mod_single = mod[indices_single,:]
-                mod_torch  =np.zeros([len(indices_single), 3,6])
+                mod_single = mod[indices_single, :]
+                mod_torch = np.zeros([len(indices_single), 3, 6])
 
-
-                for i in range(np.size(mod_torch,0)):
+                for i in range(np.size(mod_torch, 0)):
                     for j in range(3):
-                        mod_torch[i,j,0:3] = mod_single[i,j][0]
+                        mod_torch[i, j, 0:3] = mod_single[i, j][0]
                         mod_torch[i, j, 3] = mod_single[i, j][1]
                         mod_torch[i, j, 4] = mod_single[i, j][2]
                         mod_torch[i, j, 5] = mod_single[i, j][3]
-
-
 
                 roi_idx = self.sum_ds.roi_id[indices_single]
 
                 roi_info, pixels = process_movie.load_rois(self.rois_fn)
                 pixels = pixels[roi_idx]
-                roi_pos = np.vstack((roi_info['x'],roi_info['y'])).T
-                roi_pos = roi_pos[roi_idx,:]
+                roi_pos = np.vstack((roi_info['x'], roi_info['y'])).T
+                roi_pos = roi_pos[roi_idx, :]
                 if pattern == 1:
                     mod_torch = mod_torch[:, [0, 2, 4], :]
-                    pixels = pixels[:,[0, 2, 4],:]
+                    pixels = pixels[:, [0, 2, 4], :]
                 if pattern == 2:
                     mod_torch = mod_torch[:, [1, 3, 5], :]
                     pixels = pixels[:, [1, 3, 5], :]
                 with torch.no_grad():
                     dev = torch.device('cuda')
 
-                    smp_ = torch.from_numpy(pixels).to(dev) # summed for modulated model
+                    smp_ = torch.from_numpy(pixels).to(dev)  # summed for modulated model
                     mod_ = torch.from_numpy(np.asarray(mod_torch)).to(dev)
 
                     initial = np.zeros([len(indices_single), 5])
                     dims = 3
-                    initial[:,:dims] = self.sum_ds.local_pos[indices_single]
-                    initial[:,-1] = self.sum_ds.background[indices_single] # divide by numpat?????????????????????????????????????
+                    initial[:, :dims] = self.sum_ds.local_pos[indices_single]
+                    initial[:, -1] = self.sum_ds.background[indices_single]  # divide by numpat?????????????????????????????????????
                     if only_illu:
-                        initial[:, -1] =  initial[:, -1]*self.roisize
-                    initial[:,-2] = self.sum_ds.photons[indices_single]
+                        initial[:, -1] = initial[:, -1] * self.roisize
+                    initial[:, -2] = self.sum_ds.photons[indices_single]
 
                     initial_ = torch.from_numpy(initial).to(dev)
 
-                    psf_model = Gaussian2DAstigmaticPSF(self.roisize, [calib.x, calib.y])
+                    #psf_model = Gaussian2DAstigmaticPSF(self.roisize, [calib.x, calib.y])
                     roi_pos_ = torch.from_numpy(roi_pos).to(dev)
                     if only_illu:
 
-                        sf_model_ = ModulatedIntensitiesModel(roi_pos_,bg_factor=self.roisize**2)
+                        sf_model_ = ModulatedIntensitiesModel(roi_pos_, bg_factor=self.roisize ** 2)
                     elif vector:
-                        sf_model_ = SIMFLUXModel_vector(psf_model, roi_pos_, divide_bg=False, roisize=self.roisize)
+                        #sf_model_ = SIMFLUXModel_vector(psf_model, roi_pos_, divide_bg=False, roisize=self.roisize)
+                        _=0
                     else:
-                        sf_model_ = SIMFLUXModel(psf_model, roi_pos_, divide_bg=False)
+                        #sf_model_ = SIMFLUXModel(psf_model, roi_pos_, divide_bg=False)
+                        _=0
                     param_range = np.array([
                         [2, self.roisize - 3],
                         [2, self.roisize - 3],
@@ -2693,35 +1729,35 @@ class SimfluxProcessor:
                     if vector:
 
                         mle = LM_MLE_simflux(sf_model_, lambda_=lamda, iterations=40,
-                                     param_range_min_max=param_range, tol=1e-3)
-                        #mle = torch.jit.script(mle)
+                                             param_range_min_max=param_range, tol=1e-3)
+                        # mle = torch.jit.script(mle)
 
-                        e, traces_, _ = mle.forward(smp_,initial_, dev,mod_, False)
+                        e, traces_, _ = mle.forward(smp_, initial_, dev, mod_, False)
                         traces = traces_.cpu().numpy()
 
                         estim = e.cpu().numpy()
                         estimation = np.append(estimation, estim, axis=0)
                     else:
-                        #sf_model= lambda x: sf_model_.forward(x,roi_pos_, mod_)
-                        #sf_model = lambda x: sf_model_.forward(x, mod_)
-
+                        # sf_model= lambda x: sf_model_.forward(x,roi_pos_, mod_)
+                        # sf_model = lambda x: sf_model_.forward(x, mod_)
 
                         if only_illu:
-                            estim_, traces_ = lm_mle(sf_model_, initial_, (smp_.sum(axis=-1)).sum(axis=-1), param_range,roi_pos_,mod_,
+                            estim_, traces_ = lm_mle(sf_model_, initial_, (smp_.sum(axis=-1)).sum(axis=-1), param_range,
+                                                     roi_pos_, mod_,
                                                      iterations=50, lambda_=lamda,
                                                      store_traces=True)
 
                         else:
 
-                            estim_, traces_ = lm_mle(sf_model, initial_, smp_, param_range, iterations=200, lambda_=lamda,
+                            estim_, traces_ = lm_mle(sf_model, initial_, smp_, param_range, iterations=200,
+                                                     lambda_=lamda,
                                                      store_traces=True)
                         traces = traces_.cpu().numpy()
-                        #estim_[:,[0,1]] = estim_[:,[1,0]]
+                        # estim_[:,[0,1]] = estim_[:,[1,0]]
                         estim = estim_.cpu().numpy()
-                        estimation = np.append(estimation ,estim, axis=0)
+                        estimation = np.append(estimation, estim, axis=0)
 
-
-            #filter crap
+            # filter crap
             # border = 2.1
             # sel = ((ds.local_pos[:, 0] > border) & (ds.local_pos[:, 0] < self.roisize - border - 1) &
             #        (ds.local_pos[:, 1] > border) & (ds.local_pos[:, 1] < self.roisize - border - 1) &
@@ -2741,19 +1777,17 @@ class SimfluxProcessor:
                                        roipos=self.sum_ds.data['roipos'][indices],
                                        chisq=np.zeros(np.shape(self.sum_ds.frame[indices])))
 
-
             ds = copy.deepcopy(self.sum_ds_filtered)
-            pos = estimation*1
-            roipos_add= self.sum_ds.data['roipos'][indices]
-            pos[:, 0:2] += roipos_add[:,[-1,-2]]
-            ds.pos = pos[:,:3]
-            ds.photons = estimation[:,3]
-            ds.background = estimation[:,4]
+            pos = estimation * 1
+            roipos_add = self.sum_ds.data['roipos'][indices]
+            pos[:, 0:2] += roipos_add[:, [-1, -2]]
+            ds.pos = pos[:, :3]
+            ds.photons = estimation[:, 3]
+            ds.background = estimation[:, 4]
 
-
-            self.sf_ds = ds
-            self.sf_ds.save(self.resultprefix + "simflux"  + ".hdf5")
-            self.sum_ds_filtered.save(self.resultprefix + "g2d-filtered"  + ".hdf5")
+            self.zf_ds = ds
+            self.zf_ds.save(self.resultprefix + "simflux" + ".hdf5")
+            self.sum_ds_filtered.save(self.resultprefix + "g2d-filtered" + ".hdf5")
             return traces
 
     def plot_sine(self, pat=0, spot=0, itnum=0):
@@ -2788,19 +1822,17 @@ class SimfluxProcessor:
         except:
             print('no fit possible')
 
-
-
-
-    def fit_sine(self,lateral=False, display=False):
+    def fit_sine(self, lateral=False, display=False, direction='x', stepsize=64):
         if lateral:
-            def sinfunc(t, freq, A, p, c,slope):  return A * np.sin(-2 * np.pi*freq *t+ p) + c + slope*t
+            def sinfunc(t, freq, A, p, c, slope):
+                return A * np.sin(-2 * np.pi * freq * t + p) + c + slope * t
         else:
-            def sinfunc(t, A, p, c):  return A * np.sin(2*np.pi/len(self.pattern_frames) * t + p) + c
+            def sinfunc(t, A, p, c):
+                return A * np.sin(2 * np.pi / len(self.pattern_frames) * t + p) + c
         import scipy
         chi_test_mat = np.zeros([np.size(self.sum_ds.IBg, 0)])
         modulation_mat = np.zeros([np.size(self.sum_ds.IBg, 0)])
         p = np.zeros([np.size(self.sum_ds.IBg, 0)])
-
 
         if lateral:
             pattern = self.pattern_frames[0]
@@ -2809,23 +1841,27 @@ class SimfluxProcessor:
             pattern = self.pattern_frames
             x = np.arange(len(pattern))
 
-        y = self.sum_ds.IBg[:,:,0]/np.array([np.max(self.sum_ds.IBg[:,:,0], axis=1)]).T
+        y = self.sum_ds.IBg[:, :, 0] / np.array([np.max(self.sum_ds.IBg[:, :, 0], axis=1)]).T
 
-
-        guess = np.array([np.std(y, axis=1) * 2. ** 0.5, np.ones(np.size(y,0))*np.pi, np.mean(y,axis=1)])
+        guess = np.array([np.std(y, axis=1) * 2. ** 0.5, np.ones(np.size(y, 0)) * np.pi, np.mean(y, axis=1)])
         bounds = ([0, 0, -np.inf], [np.inf, 2 * np.pi, np.inf])
-        if lateral:
-            guess = np.array([np.ones(np.size(y,0))*1/10,np.std(y, axis=1) * 2. ** 0.5, np.zeros(np.size(y,0)), np.mean(y, axis=1), np.zeros(np.size(y,0))])
-            bounds = ([-np.inf,0, -2*np.pi, -np.inf,-1], [np.inf,np.inf, 2 * np.pi, np.inf,1])
-        popt_mat = np.zeros([np.size(self.sum_ds.IBg, 0), np.size(guess,0)])
-        for j in range(np.size(y,0)):
+        if lateral and direction != 'z':
+            guess = np.array([np.ones(np.size(y, 0)) * 1 / 10, np.std(y, axis=1) * 2. ** 0.5, np.zeros(np.size(y, 0)),
+                              np.mean(y, axis=1), np.zeros(np.size(y, 0))])
+            bounds = ([-np.inf, 0, -2 * np.pi, -np.inf, -1], [np.inf, np.inf, 2 * np.pi, np.inf, 1])
+        elif lateral:
+            guess = np.array([np.ones(np.size(y, 0)) * 1 / 35, np.std(y, axis=1) * 2. ** 0.5, np.zeros(np.size(y, 0)),
+                              np.mean(y, axis=1), np.zeros(np.size(y, 0))])
+            bounds = ([-np.inf, 0, -2 * np.pi, -np.inf, -1], [np.inf, np.inf, 2 * np.pi, np.inf, 1])
+        popt_mat = np.zeros([np.size(self.sum_ds.IBg, 0), np.size(guess, 0)])
+        for j in range(np.size(y, 0)):
             try:
-                popt_mat[j,:], pcov = scipy.optimize.curve_fit(sinfunc, x, y[j,:],
-                                              method='trf', p0=guess[:,j], bounds= bounds)
+                popt_mat[j, :], pcov = scipy.optimize.curve_fit(sinfunc, x, y[j, :],
+                                                                method='trf', p0=guess[:, j], bounds=bounds)
 
-                #chi_test_mat[j,i] = np.sum((y[j,:] - sinfunc(x, *popt_mat[j,:])) ** 2 / sinfunc(x, *popt_mat[j,:]))
+                # chi_test_mat[j,i] = np.sum((y[j,:] - sinfunc(x, *popt_mat[j,:])) ** 2 / sinfunc(x, *popt_mat[j,:]))
                 chi_test_mat[j], p[j] = scipy.stats.chisquare(y[j, :], sinfunc(x, *popt_mat[j, :]))
-                modulation_mat[j] = (max(y[j,:]) - min(y[j,:])) / (max(y[j,:]) + min(y[j,:]))
+                modulation_mat[j] = (max(y[j, :]) - min(y[j, :])) / (max(y[j, :]) + min(y[j, :]))
             except:
                 chi_test_mat[j] = np.nan
                 modulation_mat[j] = np.nan
@@ -2838,17 +1874,19 @@ class SimfluxProcessor:
                                   'weight': 'normal', 'size': 12}
                 rc('text', usetex=True)
                 rc('font', **fontProperties)
-                fig, ax = plt.subplots(figsize=(8 * cm, 5 * cm))
+                fig, ax = plt.subplots(figsize=(8 * cm, 4.5 * cm))
                 ax.tick_params(axis='both', which='major', labelsize=10)
                 ax.set_prop_cycle(color=[
                     '#1f77b4', '#1f77b4', '#ff7f0e', '#ff7f0e'
                 ])
+
                 # plt.rcParams['text.usetex'] = True
 
-                plt.scatter(x*64, y[j], label='Data')
-                plt.plot(np.linspace(0,x[-1],100)*64,sinfunc(np.linspace(0,x[-1],100),*popt_mat[j,:]),label='Sinusoidal fit')
+                plt.scatter(x * stepsize, y[j], label='Signal PSF')
+                plt.plot(np.linspace(0, x[-1], 100) * stepsize, sinfunc(np.linspace(0, x[-1], 100), *popt_mat[j, :]),
+                         label='Sinusoidal fit')
 
-                xlabel = 'Distance [nm]'
+                xlabel = 'Stage shift [nm]'
                 ylabel = 'Intensity [au]'
                 ax.spines['top'].set_visible(False)
                 ax.spines['right'].set_visible(False)
@@ -2858,13 +1896,13 @@ class SimfluxProcessor:
                 # stylize_axes(ax)
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel(ylabel)
-                fontProperties = {'family': 'sans-serif', 'sans-serif': ['Helvetica'],
-                                  'weight': 'normal', 'size': 10}
-                ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.3), frameon=False)
+                # fontProperties = {'family': 'sans-serif', 'sans-serif': ['Helvetica'],
+                #                   'weight': 'normal', 'size': 10}
+                ax.legend(loc=[0.5, 0.74], frameon=False, prop={'size': 10})
 
-                #ax.set_xticks(np.arange(1.0, 9.0, 1))
+                # ax.set_xticks(np.arange(1.0, 9.0, 1))
                 rc('font', **fontProperties)
-                #fig.tight_layout()
+                fig.tight_layout()
 
                 # plt.savefig('C:/Users/Gebruiker/Desktop/inkscape/fig_lateral_pitch/sinewave.png', bbox_inches='tight',
                 #             pad_inches=0.01, dpi=600)
@@ -2876,37 +1914,34 @@ class SimfluxProcessor:
         self.sum_ds.pvalues = p
         self.sum_ds.modulation = modulation_mat
 
-
-
-        #self.filter_onR()
+        # self.filter_onR()
         return chi_test_mat, p, modulation_mat
 
-    def filter_onR(self, filter = 0.05, min_mod = 0.7, display = False):
-
+    def filter_onR(self, filter=0.05, min_mod=0.7, display=False):
 
         maxp = self.sum_ds.pvalues
 
-
-        pindices = maxp < (1-filter)
-        print('filtered '+ str(int(sum(pindices))) + '/'+str(int(len(pindices))) + ' based on p value'  )
-        sorted_indc = np.argsort(-1*maxp)
+        pindices = maxp < (1 - filter)
+        print('filtered ' + str(int(sum(pindices))) + '/' + str(int(len(pindices))) + ' based on p value')
+        sorted_indc = np.argsort(-1 * maxp)
         test = pindices[sorted_indc]
 
         best_denied = sorted_indc[test]
         maxmod = self.sum_ds.modulation
-        mod_ind = maxmod<min_mod
+        mod_ind = maxmod < min_mod
         print('filtered ' + str(int(sum(mod_ind))) + '/' + str(int(len(mod_ind))) + ' based on modulation')
         if display:
-            for i in range(np.min([5,len(best_denied)])):
+            for i in range(np.min([5, len(best_denied)])):
                 pattern = np.argmin(self.sum_ds.pvalues[best_denied[i], :])
-                self.plot_sine(pattern,best_denied[i], i)
-        print('filtered ' + str(int(sum(np.logical_or(mod_ind,pindices)))) + '/' + str(int(len(mod_ind))) + ' in total')
-        self.remove_indices(np.logical_or(mod_ind,pindices))
+                self.plot_sine(pattern, best_denied[i], i)
+        print(
+            'filtered ' + str(int(sum(np.logical_or(mod_ind, pindices)))) + '/' + str(int(len(mod_ind))) + ' in total')
+        self.remove_indices(np.logical_or(mod_ind, pindices))
 
     def selected_roi_source(self, indices):
         """
         Yields roipos,pixels,idx for the selected ROIs.
-        'indices' indexes into the set of ROIs selected earlier by gaussian_fitting(), stored in roi_indices
+        'indices' indexes into the set of ROIs selected earlier by spot_fitting(), stored in roi_indices
         idx is the set of indices in the block, indexing into self.sum_ds
         """
         roi_idx = self.sum_ds.roi_id[indices]
@@ -3121,7 +2156,7 @@ class SimfluxProcessor:
             print('Running continuous FRC on drift-corrected data')
         else:
             g_data = self.sum_ds_filtered
-            sf_data = self.sf_ds
+            sf_data = self.zf_ds
 
         if np.isscalar(freq):
             freq = np.linspace(0,freq,200)
@@ -3164,46 +2199,6 @@ class SimfluxProcessor:
             f.write(msg+"\n")
         print(msg)
 
-    def simulate(self, nframes, bg, gt: Dataset, output_fn, blink_params=None,
-                 em_drift=None, exc_drift=None, debugMode=False):
-        """
-        Simulate SMLM dataset with excitation patterns. Very basic atm,
-        spots are either off or on during the entire series of modulation patterns (6 frames for simflux)
-        """
-        with Context(debugMode=debugMode) as ctx, self.create_psf(ctx, True) as psf,  \
-              multipart_tiff.MultipartTiffSaver(output_fn) as tif, tqdm.tqdm(total=nframes) as pb:
-
-            sampleframes = psf.sampleshape[0] if len(psf.sampleshape)==3 else 1
-
-            for f, spot_ontimes in enumerate(blinking_spots.blinking(len(gt), nframes // sampleframes,
-                                    **(blink_params if blink_params is not None else {}), subframe_blink=1)):
-
-
-                which = np.where(spot_ontimes > 0)[0]
-
-                params = np.zeros((len(which), gt.dims+2),dtype=np.float32)
-                params[:,:gt.dims] = gt.pos[which]
-                params[:,-2] = gt.photons[which]
-
-                roiposYX = (params[:,[1,0]] - psf.sampleshape[-2:]/2).astype(np.int32)
-                params[:,:2] -= roiposYX[:,[1,0]]
-
-                roipos = np.zeros((len(which),3),dtype=np.int32)
-                roipos[:,1:] = roiposYX
-
-                # this way the modulation pattern will automatically be broadcasted
-                # into the required (spots, npatterns, 6) shape
-                rois = psf.ExpectedValue(params, roipos=roipos, 
-                                         constants=self.mod.view(np.float32)) 
-                
-                                
-                for i in range(sampleframes):
-                    img = np.zeros(gt.imgshape, dtype=np.float32)
-                    ctx.smlm.DrawROIs(img, rois[:,i], roiposYX)
-                    img += bg
-                    tif.save(np.random.poisson(img))
-                    pb.update()
-
 
     def drift_correct(self, **kwargs):
         self.drift, est_ = self.sum_ds.estimateDriftMinEntropy(
@@ -3213,24 +2208,6 @@ class SimfluxProcessor:
         self.sum_ds_undrift = self.sum_ds[:]
         self.sum_ds_undrift.applyDrift(self.drift)
         self.sum_ds_undrift.save(self.resultsdir + "g2d_dme.hdf5")
-
-    def drift_correct_sum_ds_filtered(self, **kwargs):
-        self.drift, est_ = self.sum_ds.estimateDriftMinEntropy(
-            coarseSigma=self.sum_ds.crlb.pos.mean(0) * 4,
-            pixelsize=self.cfg['pixelsize'], **kwargs)
-
-        self.sum_ds_undrift = self.sum_ds[:]
-        self.sum_ds_undrift.applyDrift(self.drift)
-        self.sum_ds_undrift.save(self.resultsdir + "g2d_filtered_dme.hdf5")
-
-    def drift_correctsf(self, **kwargs):
-        self.drift, est_ = self.sf_ds.estimateDriftMinEntropy(
-            coarseSigma=self.sf_ds.crlb.pos.mean(0)*4,
-            pixelsize=self.cfg['pixelsize'], **kwargs)
-
-        self.sf_ds_undrift = self.sf_ds[:]
-        self.sf_ds_undrift.applyDrift(self.drift)
-        self.sf_ds_undrift.save(self.resultsdir + "sf_dme.hdf5")
 
 
     def phase_undrift(self):
@@ -3257,8 +2234,6 @@ class SimfluxProcessor:
         return ds
 
 
-    def cluster_plot(self):
-        ...
 
     def __enter__(self):
         return self
@@ -3273,56 +2248,7 @@ class SimfluxProcessor:
     def intensity_fits(self):
         ...
 
-    def estimate_patterns_iter(self, num_angle_bins=1,
-                          num_phase_bins=10,
-                          pitch_minmax_nm=[300, 1500],
-                          p_ax=0,
-                          fix_phase_shifts=None,
-                          fix_depths=None,
-                          show_plots=True,
-                          phase_method=1,
-                          dft_peak_search_range=0.02,
-                               first_iteration =False, kz = np.array([])):
-
-        if first_iteration == True:
-            kx0 = 0.5
-            ky0 = 0.5
-            kz0 = 5
-            #kx0 =  self.mod['k'][self.pattern_frames[0], 0][0]
-            #ky0 = self.mod['k'][self.pattern_frames[0], 1][0]
-            # kz0 = 5.05
-            self.excDims =3
-
-            kx1 = 0.5
-            ky1 = -0.5
-            kz1 = 5
-            #kx1 = self.mod['k'][self.pattern_frames[1], 0][0]
-            #ky1 = self.mod['k'][self.pattern_frames[1], 1][0]
-            # kz1 = 5.05
-
-        if kz.size:
-            kz0 = kz[0]
-            kz1 = kz[1]
-
-        flag = 0*1
-        for k in range(len(self.pattern_frames)):
-            if flag ==0:
-                self.mod['k'][self.pattern_frames[k], :3] = kx0, ky0, kz0
-            if flag ==1:
-                self.mod['k'][self.pattern_frames[k], :3] = kx1, ky1, kz1
-            flag += 1
-
-    def drawUpdate(self, mapping, centers):
-        plt.figure(figsize=(30, 30))
-        plt.scatter(pts[:, 0], pts[:, 1], c=mapping, s=1, marker='o')
-
-        for k in range(len(centers)):
-            circle = plt.Circle((centers[k, 0], centers[k, 1]), dist, color='r', fill=False)
-            plt.gca().add_artist(circle)
-
-        print(np.max(mapping))
-
-    def cluster_picassopicks(self, pattern=0, depth=0, drift_corrected=False, fit_gaussians=False, prefix='0'):
+    def cluster_picassopicks(self):
         import yaml
         from yaml.loader import SafeLoader
         from sklearn.cluster import KMeans, SpectralClustering
@@ -3332,16 +2258,11 @@ class SimfluxProcessor:
         def gauss(x, a, x0, sigma, c):
             return a * np.exp(-(x - x0) ** 2 / (2 * sigma ** 2) + c)
 
-        folder = 'nanorulers_simflux_10ms_originalanglejan13_2_firstpattern'
-        if pattern != 0:
-            kzname = str(np.round(self.mod[pattern - 1][0][2], 4))
-            filename = "E:/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/all_picks_v2.yaml"
-            #filename = "C:/data/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/pickregions.yaml"
 
-        else:
-            kzname = str(np.round(self.mod[0][0][2], 4)) + '_' + str(np.round(self.mod[1][0][2], 4))
-            filename = "E:/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/all_picks_v2.yaml"
-            #filename = "C:/data/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/pickregions.yaml"
+
+
+        kzname = str(np.round(self.mod[0][0][2], 4)) + '_' + str(np.round(self.mod[1][0][2], 4))
+        filename = "./all_picks_v2.yaml"
 
 
         with open(filename) as f:
@@ -3349,19 +2270,14 @@ class SimfluxProcessor:
 
         centers = data['Centers']
         diameter = data['Diameter']
-        if drift_corrected:
-            pos_smlm = self.sum_ds_filtered_undrift.pos
-            pos_sf = self.sf_ds_undrift.pos
-            photons_sf = self.sf_ds.photons
-            bg_sf = self.sf_ds.background
-        else:
 
-            pos_smlm = self.sum_ds_filtered.pos
-            pos_sf = self.sf_ds.pos
-            photons_sf = self.sf_ds.photons
-            bg_sf = self.sf_ds.background
-        bias_array = np.empty((0,3))
-        mean_array = np.empty((0,3))
+
+        pos_smlm = self.sum_ds_filtered.pos
+        pos_sf = self.zf_ds.pos
+        photons_sf = self.zf_ds.photons
+        bg_sf = self.zf_ds.background
+        bias_array = np.empty((0, 3))
+        mean_array = np.empty((0, 3))
 
         distance_array_sf = np.array([])
         angle_array_sf = np.array([])
@@ -3375,289 +2291,264 @@ class SimfluxProcessor:
         full_array_bg_cluster0 = np.empty((0))
         full_array_bg_cluster1 = np.empty((0))
 
-
         for i in range(len(centers)):
             center = np.array(centers[i])
-            array = (pos_smlm[:,0]-center[0])**2 + (pos_smlm[:,1]-center[1])**2< (diameter/2)**2
+            array = (pos_smlm[:, 0] - center[0]) ** 2 + (pos_smlm[:, 1] - center[1]) ** 2 < (diameter / 2) ** 2
 
-            full_array_smlm = np.concatenate((pos_smlm[array,0, None] * 65, pos_smlm[array,1, None] * 65,pos_smlm[array,2, None]*1000), axis=-1)
+            full_array_smlm = np.concatenate(
+                (pos_smlm[array, 0, None] * 65, pos_smlm[array, 1, None] * 65, pos_smlm[array, 2, None] * 1000),
+                axis=-1)
             full_array_sf = np.concatenate(
                 (pos_sf[array, 0, None] * 65, pos_sf[array, 1, None] * 65, pos_sf[array, 2, None] * 1000),
                 axis=-1)
             photons = photons_sf[array]
             photons_bg = bg_sf[array]
-            if len(full_array_smlm)>50 and len(full_array_sf)>50 :
+            if len(full_array_smlm) > 50 and len(full_array_sf) > 50:
                 kmeans_smlm = KMeans(n_clusters=2).fit(full_array_smlm)
                 kmeans_sf = KMeans(n_clusters=2).fit(full_array_sf)
-                kmeans_sf.cluster_centers_[0,:] = np.mean(full_array_sf[kmeans_smlm.labels_ == 0], axis=0)
+                kmeans_sf.cluster_centers_[0, :] = np.mean(full_array_sf[kmeans_smlm.labels_ == 0], axis=0)
                 kmeans_sf.cluster_centers_[1, :] = np.mean(full_array_sf[kmeans_smlm.labels_ == 1], axis=0)
 
-
                 if np.sum(kmeans_smlm.labels_ == 0) > 30 and np.sum(kmeans_smlm.labels_ == 1) > 30 and \
-                    np.array([np.linalg.norm(kmeans_sf.cluster_centers_[0, :] - kmeans_sf.cluster_centers_[1, :])])<150 and \
-                        kmeans_smlm.cluster_centers_[0,0]>5000:
-                    if False:
-                        fig = plt.figure()
-                        ax = fig.add_subplot(projection='3d')
-                        ax.scatter(full_array_sf[kmeans_smlm.labels_ == 0][:,0],full_array_sf[kmeans_smlm.labels_ == 0][:,1],full_array_sf[kmeans_smlm.labels_ == 0][:,2])
-                        ax.scatter(full_array_sf[kmeans_smlm.labels_ == 1][:,0],full_array_sf[kmeans_smlm.labels_ == 1][:,1], full_array_sf[kmeans_smlm.labels_ == 1][:,2])
-                        plt.show()
-                    #if np.sum(kmeans_sf.labels_ == 0) > 30 and np.sum(kmeans_sf.labels_ == 1) > 30:
-                    # full_array_photons_cluster0 = np.append(full_array_photons_cluster0,np.mean(photons[kmeans_sf.labels_ == 0]))
-                    # full_array_photons_cluster1 = np.append(full_array_photons_cluster1,np.mean(photons[kmeans_sf.labels_ == 1]))
-                    #
-                    # full_array_bg_cluster0 = np.append(full_array_bg_cluster0,np.mean(photons_bg[kmeans_sf.labels_ == 0]))
-                    # full_array_bg_cluster1 = np.append(full_array_bg_cluster1,np.mean(photons_bg[kmeans_sf.labels_ == 1]))
+                        np.array([np.linalg.norm(
+                            kmeans_sf.cluster_centers_[0, :] - kmeans_sf.cluster_centers_[1, :])]) < 150 and \
+                        kmeans_smlm.cluster_centers_[0, 0] > 5000:
 
-                    bias = kmeans_smlm.cluster_centers_-kmeans_sf.cluster_centers_
+                    bias = kmeans_smlm.cluster_centers_ - kmeans_sf.cluster_centers_
                     mean_value = kmeans_smlm.cluster_centers_
-                    bias_array= np.concatenate((bias_array,bias))
-                    mean_array = np.concatenate((mean_array,mean_value))
-                    mean_array_cluster0  = mean_array
-                    distance_array_sf =  np.concatenate((distance_array_sf, np.array([np.linalg.norm(kmeans_sf.cluster_centers_[0,:] - kmeans_sf.cluster_centers_[1, :])])))
+                    bias_array = np.concatenate((bias_array, bias))
+                    mean_array = np.concatenate((mean_array, mean_value))
+                    mean_array_cluster0 = mean_array
+                    distance_array_sf = np.concatenate((distance_array_sf, np.array(
+                        [np.linalg.norm(kmeans_sf.cluster_centers_[0, :] - kmeans_sf.cluster_centers_[1, :])])))
 
-                    distance_array_smlm = np.concatenate((distance_array_smlm, np.array([np.linalg.norm(kmeans_smlm.cluster_centers_[0,:] - kmeans_smlm.cluster_centers_[1, :])])))
+                    distance_array_smlm = np.concatenate((distance_array_smlm, np.array(
+                        [np.linalg.norm(kmeans_smlm.cluster_centers_[0, :] - kmeans_smlm.cluster_centers_[1, :])])))
 
                     diff_sf = kmeans_sf.cluster_centers_[0, :] - kmeans_sf.cluster_centers_[1, :]
-                    angle_array_sf=np.concatenate((angle_array_sf, np.array([np.arctan(np.sqrt(diff_sf[0]**2 + diff_sf[1]**2)/abs(diff_sf[2]))]) ))
+                    angle_array_sf = np.concatenate((angle_array_sf, np.array(
+                        [np.arctan(np.sqrt(diff_sf[0] ** 2 + diff_sf[1] ** 2) / abs(diff_sf[2]))])))
                     diff_smlm = kmeans_smlm.cluster_centers_[0, :] - kmeans_smlm.cluster_centers_[1, :]
-                    angle_array_smlm = np.concatenate((angle_array_smlm, np.array([np.arctan(np.sqrt(diff_smlm[0]**2 + diff_smlm[1]**2)/abs(diff_smlm[2])) ])))
+                    angle_array_smlm = np.concatenate((angle_array_smlm, np.array(
+                        [np.arctan(np.sqrt(diff_smlm[0] ** 2 + diff_smlm[1] ** 2) / abs(diff_smlm[2]))])))
 
-                    if fit_gaussians:
-
-                        # stuff for plotting things:
-                        binwidth = 5
-                        plt.hist(full_array_smlm[:,2], label='SMLM', alpha=0.5,
-                                 facecolor='blue',
-                                 bins=np.arange(min(full_array_smlm[:,2]), max(full_array_smlm[:,2]) + binwidth, binwidth))
-                        plt.hist(full_array_sf[:,2], label='Simflux', alpha=0.5,
-                                 facecolor='red',
-                                 bins=np.arange(min(full_array_sf[:,2]), max(full_array_sf[:,2]) + binwidth, binwidth))
-                        for kmean in range(2):
-                            init_fit_smlm = scipy.stats.norm.fit(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean])
-                            init_fit_sf = scipy.stats.norm.fit(full_array_sf[:,2][kmeans_smlm.labels_ == kmean])
-
-                            n_smlm, bins_smlm = np.histogram(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean],
-                                                   bins=np.arange(min(full_array_smlm[:,2]), max(full_array_smlm[:,2]) + binwidth, binwidth))
-                            n_sf, bins_sf = np.histogram(full_array_sf[:,2][kmeans_smlm.labels_ == kmean],
-                                                             bins=np.arange(min(full_array_sf[:,2]),
-                                                                            max(full_array_sf[:,2]) + binwidth, binwidth))
-
-                            popt_smlm, pcov_smlm = curve_fit(gauss, (bins_smlm[1:] + bins_smlm[:-1]) / 2, n_smlm,
-                                                             p0=[max(n_smlm), init_fit_smlm[0], init_fit_smlm[1], 0],
-                                                             maxfev=2000)
-                            popt_sf, pcov_sf = curve_fit(gauss, (bins_sf[1:] + bins_sf[:-1]) / 2, n_sf,
-                                                             p0=[max(n_sf), init_fit_sf[0], init_fit_sf[1], 0],
-                                                             maxfev=2000)
-                            plt.plot(np.linspace(min(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean]),
-                                                 max(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean]), 50),
-                                     gauss(np.linspace(min(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean]),
-                                                       max(full_array_smlm[:,2][kmeans_smlm.labels_ == kmean]), 50), *popt_smlm),
-                                     c='blue', label=str(popt_smlm[1].round(1)) + ' +/-' + str(popt_smlm[2].round(1)))
-                            plt.plot(np.linspace(min(full_array_sf[:,2][kmeans_sf.labels_ == kmean]),
-                                                 max(full_array_sf[:,2][kmeans_sf.labels_ == kmean]), 50),
-                                     gauss(np.linspace(min(full_array_sf[:,2][kmeans_sf.labels_ == kmean]),
-                                                       max(full_array_sf[:,2][kmeans_sf.labels_ == kmean]), 50), *popt_sf),
-                                     c='red', label=str(popt_sf[1].round(1)) + ' +/-' + str(popt_sf[2].round(1)))
-
-                        # n, bins, patches = plt.hist(data_plot, label=filename, alpha=0.5,
-                        #                             facecolor=color[i],
-                        #                             bins=np.arange(min(data_plot), max(data_plot) + binwidth, binwidth))
-                        plt.title('detection cluster %i' % (i))
-                        plt.xlabel('z (nm)')
-                        plt.ylabel('count')
-                        plt.legend()
-                        import os
-                        folder_results = "E:/SIMFLUX Z/" + folder + "/results/results10msnov/test" + prefix +str(depth)
-                        isExist = os.path.exists("E:/SIMFLUX Z/" + folder + "/results/results10msnov/")
-                        # folder_results = 'C:/Users/Gebruiker/Desktop/results10msnov/test' + prefix +str(depth)
-                        # isExist = os.path.exists('C:/Users/Gebruiker/Desktop/results10msnov/')
-
-
-                        if not isExist:
-                            #os.mkdir('C:/Users/GrunwaldLab/Desktop/results10msnov/')
-                            os.mkdir("E:/SIMFLUX Z/" + folder + "/results/results10msnov/")
-
-                        isExist = os.path.exists(folder_results)
-                        if not isExist:
-                            os.mkdir(folder_results)
-                        plt.savefig(
-                            folder_results + "/detection cluster %i.png" % (
-                                i))
-                        plt.close()
-                        # plot clusters seperately
-                        for kmean in range(2):
-                            binwidth = 8
-                            plt.hist(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean], label='SMLM', alpha=0.5,
-                                     facecolor='blue',
-                                     bins=np.arange(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]) + binwidth,
-                                                    binwidth))
-                            plt.hist(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean], label='Simflux', alpha=0.5,
-                                     facecolor='red',
-                                     bins=np.arange(min(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean]), max(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean]) + binwidth,
-                                                    binwidth))
-                            init_fit_smlm = scipy.stats.norm.fit(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean])
-                            init_fit_sf = scipy.stats.norm.fit(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean])
-
-                            n_smlm, bins_smlm = np.histogram(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean],
-                                                             bins=np.arange(min(full_array_smlm[:, 2]),
-                                                                            max(full_array_smlm[:, 2]) + binwidth,
-                                                                            binwidth))
-                            n_sf, bins_sf = np.histogram(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean],
-                                                         bins=np.arange(min(full_array_sf[:, 2]),
-                                                                        max(full_array_sf[:, 2]) + binwidth, binwidth))
-
-                            popt_smlm, pcov_smlm = curve_fit(gauss, (bins_smlm[1:] + bins_smlm[:-1]) / 2, n_smlm,
-                                                             p0=[max(n_smlm), init_fit_smlm[0], init_fit_smlm[1], 0],
-                                                             maxfev=2000, bounds=[[0,-np.inf,0,0],[np.inf,np.inf,np.inf,np.inf]])
-                            std_smlm.append(popt_smlm[2])
-                            popt_sf, pcov_sf = curve_fit(gauss, (bins_sf[1:] + bins_sf[:-1]) / 2, n_sf,
-                                                         p0=[max(n_sf), init_fit_sf[0], init_fit_sf[1], 0],
-                                                         maxfev=2000, bounds=[[0,-np.inf,0,0],[np.inf,np.inf,np.inf,np.inf]])
-                            std_sf.append(popt_sf[2])
-                            plt.plot(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
-                                                 max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
-                                     gauss(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
-                                                       max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
-                                           *popt_smlm),
-                                     c='blue', label=str(popt_smlm[1].round(1)) + ' +/-' + str(popt_smlm[2].round(1)))
-                            plt.plot(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
-                                                 max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
-                                     gauss(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
-                                                       max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
-                                           *popt_sf),
-                                     c='red', label=str(popt_sf[1].round(1)) + ' +/-' + str(popt_sf[2].round(1)))
-                            plt.title('binding site '+str(kmean)+ ' detection cluster %i' % (i))
-                            plt.xlabel('z (nm)')
-                            plt.ylabel('count')
-                            plt.legend()
-                            plt.savefig(
-                                folder_results + "/binding site "+str(kmean)+ "detection cluster %i.png" % (
-                                    i))
-                            plt.close()
+                    # if plot:
+                    #
+                    #     # stuff for plotting things:
+                    #     binwidth = 5
+                    #     plt.hist(full_array_smlm[:, 2], label='SMLM', alpha=0.5,
+                    #              facecolor='blue',
+                    #              bins=np.arange(min(full_array_smlm[:, 2]), max(full_array_smlm[:, 2]) + binwidth,
+                    #                             binwidth))
+                    #     plt.hist(full_array_sf[:, 2], label='Simflux', alpha=0.5,
+                    #              facecolor='red',
+                    #              bins=np.arange(min(full_array_sf[:, 2]), max(full_array_sf[:, 2]) + binwidth,
+                    #                             binwidth))
+                    #     for kmean in range(2):
+                    #         init_fit_smlm = scipy.stats.norm.fit(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean])
+                    #         init_fit_sf = scipy.stats.norm.fit(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean])
+                    #
+                    #         n_smlm, bins_smlm = np.histogram(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean],
+                    #                                          bins=np.arange(min(full_array_smlm[:, 2]),
+                    #                                                         max(full_array_smlm[:, 2]) + binwidth,
+                    #                                                         binwidth))
+                    #         n_sf, bins_sf = np.histogram(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean],
+                    #                                      bins=np.arange(min(full_array_sf[:, 2]),
+                    #                                                     max(full_array_sf[:, 2]) + binwidth, binwidth))
+                    #
+                    #         popt_smlm, pcov_smlm = curve_fit(gauss, (bins_smlm[1:] + bins_smlm[:-1]) / 2, n_smlm,
+                    #                                          p0=[max(n_smlm), init_fit_smlm[0], init_fit_smlm[1], 0],
+                    #                                          maxfev=2000)
+                    #         popt_sf, pcov_sf = curve_fit(gauss, (bins_sf[1:] + bins_sf[:-1]) / 2, n_sf,
+                    #                                      p0=[max(n_sf), init_fit_sf[0], init_fit_sf[1], 0],
+                    #                                      maxfev=2000)
+                    #         plt.plot(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                              max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
+                    #                  gauss(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                                    max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
+                    #                        *popt_smlm),
+                    #                  c='blue', label=str(popt_smlm[1].round(1)) + ' +/-' + str(popt_smlm[2].round(1)))
+                    #         plt.plot(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
+                    #                              max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
+                    #                  gauss(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
+                    #                                    max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
+                    #                        *popt_sf),
+                    #                  c='red', label=str(popt_sf[1].round(1)) + ' +/-' + str(popt_sf[2].round(1)))
+                    #
+                    #     # n, bins, patches = plt.hist(data_plot, label=filename, alpha=0.5,
+                    #     #                             facecolor=color[i],
+                    #     #                             bins=np.arange(min(data_plot), max(data_plot) + binwidth, binwidth))
+                    #     plt.title('detection cluster %i' % (i))
+                    #     plt.xlabel('z (nm)')
+                    #     plt.ylabel('count')
+                    #     plt.legend()
+                    #     import os
+                    #     folder_results = "E:/SIMFLUX Z/" + folder + "/results/results10msnov/test"  + str(depth)
+                    #     isExist = os.path.exists("E:/SIMFLUX Z/" + folder + "/results/results10msnov/")
+                    #     # folder_results = 'C:/Users/Gebruiker/Desktop/results10msnov/test' + prefix +str(depth)
+                    #     # isExist = os.path.exists('C:/Users/Gebruiker/Desktop/results10msnov/')
+                    #
+                    #     if not isExist:
+                    #         # os.mkdir('C:/Users/GrunwaldLab/Desktop/results10msnov/')
+                    #         os.mkdir("E:/SIMFLUX Z/" + folder + "/results/results10msnov/")
+                    #
+                    #     isExist = os.path.exists(folder_results)
+                    #     if not isExist:
+                    #         os.mkdir(folder_results)
+                    #     plt.savefig(
+                    #         folder_results + "/detection cluster %i.png" % (
+                    #             i))
+                    #     plt.close()
+                    #     # plot clusters seperately
+                    #     for kmean in range(2):
+                    #         binwidth = 8
+                    #         plt.hist(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean], label='SMLM', alpha=0.5,
+                    #                  facecolor='blue',
+                    #                  bins=np.arange(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                                 max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]) + binwidth,
+                    #                                 binwidth))
+                    #         plt.hist(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean], label='Simflux', alpha=0.5,
+                    #                  facecolor='red',
+                    #                  bins=np.arange(min(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                                 max(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean]) + binwidth,
+                    #                                 binwidth))
+                    #         init_fit_smlm = scipy.stats.norm.fit(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean])
+                    #         init_fit_sf = scipy.stats.norm.fit(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean])
+                    #
+                    #         n_smlm, bins_smlm = np.histogram(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean],
+                    #                                          bins=np.arange(min(full_array_smlm[:, 2]),
+                    #                                                         max(full_array_smlm[:, 2]) + binwidth,
+                    #                                                         binwidth))
+                    #         n_sf, bins_sf = np.histogram(full_array_sf[:, 2][kmeans_smlm.labels_ == kmean],
+                    #                                      bins=np.arange(min(full_array_sf[:, 2]),
+                    #                                                     max(full_array_sf[:, 2]) + binwidth, binwidth))
+                    #
+                    #         popt_smlm, pcov_smlm = curve_fit(gauss, (bins_smlm[1:] + bins_smlm[:-1]) / 2, n_smlm,
+                    #                                          p0=[max(n_smlm), init_fit_smlm[0], init_fit_smlm[1], 0],
+                    #                                          maxfev=2000, bounds=[[0, -np.inf, 0, 0],
+                    #                                                               [np.inf, np.inf, np.inf, np.inf]])
+                    #         std_smlm.append(popt_smlm[2])
+                    #         popt_sf, pcov_sf = curve_fit(gauss, (bins_sf[1:] + bins_sf[:-1]) / 2, n_sf,
+                    #                                      p0=[max(n_sf), init_fit_sf[0], init_fit_sf[1], 0],
+                    #                                      maxfev=2000,
+                    #                                      bounds=[[0, -np.inf, 0, 0], [np.inf, np.inf, np.inf, np.inf]])
+                    #         std_sf.append(popt_sf[2])
+                    #         plt.plot(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                              max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
+                    #                  gauss(np.linspace(min(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]),
+                    #                                    max(full_array_smlm[:, 2][kmeans_smlm.labels_ == kmean]), 50),
+                    #                        *popt_smlm),
+                    #                  c='blue', label=str(popt_smlm[1].round(1)) + ' +/-' + str(popt_smlm[2].round(1)))
+                    #         plt.plot(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
+                    #                              max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
+                    #                  gauss(np.linspace(min(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]),
+                    #                                    max(full_array_sf[:, 2][kmeans_sf.labels_ == kmean]), 50),
+                    #                        *popt_sf),
+                    #                  c='red', label=str(popt_sf[1].round(1)) + ' +/-' + str(popt_sf[2].round(1)))
+                    #         plt.title('binding site ' + str(kmean) + ' detection cluster %i' % (i))
+                    #         plt.xlabel('z (nm)')
+                    #         plt.ylabel('count')
+                    #         plt.legend()
+                    #         plt.savefig(
+                    #             folder_results + "/binding site " + str(kmean) + "detection cluster %i.png" % (
+                    #                 i))
+                    #         plt.close()
         cm = 1 / 2.54
-        import matplotlib
         from matplotlib import rc, font_manager
-        import scipy.interpolate
+
         fontProperties = {'family': 'sans-serif', 'sans-serif': ['Helvetica'],
                           'weight': 'normal', 'size': 12}
         rc('text', usetex=True)
         rc('font', **fontProperties)
-        filter_min = np.logical_and(bias_array[:,2] < (np.mean(bias_array[:,2]) + np.std(bias_array[:,2]))
-                                    , bias_array[:,2] > (np.mean(bias_array[:,2]) - np.std(bias_array[:,2])))
-        slope_z, offset = np.polyfit(-(mean_array[:, 2]+2*self.depth)[filter_min], bias_array[filter_min, 2], 1)
-        plt.figure(figsize=(10*cm, 8*cm))
-        plt.scatter(-(mean_array[:, 2]+2*self.depth), bias_array[:, 2],s=8)
-        plt.plot(-(mean_array[:, 2]+2*self.depth), slope_z * -(mean_array[:, 2]+2*self.depth) + offset, color='red')
-        plt.xlim([min(-(mean_array[:, 2]+2*self.depth)), max(-(mean_array[:, 2]+2*self.depth))])
+        filter_min = np.logical_and(bias_array[:, 2] < (np.mean(bias_array[:, 2]) + np.std(bias_array[:, 2]))
+                                    , bias_array[:, 2] > (np.mean(bias_array[:, 2]) - np.std(bias_array[:, 2])))
+        slope_z, offset = np.polyfit(-(mean_array[:, 2] + 2 * self.depth)[filter_min], bias_array[filter_min, 2], 1)
+        plt.figure(figsize=(10 * cm, 8 * cm))
+        plt.scatter(-(mean_array[:, 2] + 2 * self.depth), bias_array[:, 2], s=8)
+        plt.plot(-(mean_array[:, 2] + 2 * self.depth), slope_z * -(mean_array[:, 2] + 2 * self.depth) + offset,
+                 color='red')
+        plt.xlim([min(-(mean_array[:, 2] + 2 * self.depth)), max(-(mean_array[:, 2] + 2 * self.depth))])
         plt.ylim(-100, 100)
         plt.xlabel(r'$z_{pos}$ SMLM [nm]')
         plt.ylabel('Bias in z [nm]')
         plt.tight_layout(pad=0.1)
-        #plt.title('pattern = '+ str(pattern) + ', kz =' + kzname )
-
-        import os
-        if drift_corrected:
-             path_folder = "E:/SIMFLUX Z/biasplots/"
-        else:
-            path_folder = "E:/SIMFLUX Z/biasplots/"
+        # plt.title('pattern = '+ str(pattern) + ', kz =' + kzname )
 
 
         # Check whether the specified path exists or not
-        isExist = os.path.exists(path_folder)
-        if not isExist:
-            # Create a new directory because it does not exist
-            os.makedirs(path_folder)
 
-        plt.savefig(path_folder + 'bias_pat' + str(pattern) + '_kz='+kzname+'.png', dpi=600)
 
-        fig, axs = plt.subplots(2,figsize=(12*cm,8*cm))
-        #fig.suptitle('x and y bias')
-        axs[0].scatter(mean_array[:, 0], bias_array[:, 0],s=8)
+        plt.savefig(self.resultsdir + 'bias_pat_kz.png', dpi=600)
+
+        fig, axs = plt.subplots(2, figsize=(12 * cm, 8 * cm))
+        # fig.suptitle('x and y bias')
+        axs[0].scatter(mean_array[:, 0], bias_array[:, 0], s=8)
         axs[0].set_xlabel('x position SMLM [nm]')
         axs[0].set_ylabel('x bias [nm]')
         axs[0].set_ylim(-100, 100)
-        axs[1].scatter(mean_array[:, 1], bias_array[:, 1],s=8)
+        axs[1].scatter(mean_array[:, 1], bias_array[:, 1], s=8)
         axs[1].set_xlabel('y position SMLM [nm]')
         axs[1].set_ylabel('y bias [nm]')
         axs[1].set_ylim(-100, 100)
         fig.tight_layout(pad=0.1)
-        plt.savefig(path_folder + 'xy_bias' + str(pattern) + '_kz=' + kzname + '.png', dpi=600)
+        plt.savefig(self.resultsdir + 'xy_bias'  + '.png', dpi=600)
 
         plt.figure()
-        plt.scatter(mean_array[:,0],mean_array[:,1],c=bias_array[:,2])
+        plt.scatter(mean_array[:, 0], mean_array[:, 1], c=bias_array[:, 2])
         plt.xlabel('x position [nm]')
         plt.ylabel('y position [nm]')
-        #plt.title('z-bias (SMLM-SF) over FOV')
+        # plt.title('z-bias (SMLM-SF) over FOV')
         cbar = plt.colorbar()
         cbar.set_label('z-bias [nm]')
         fig.tight_layout(pad=0.1)
         plt.savefig(
-        path_folder + 'biasfov' + str(pattern) + '_kz=' + kzname + '.png')
+            self.resultsdir + 'biasfov'  + '.png')
 
         def gauss(x, a, x0, sigma, c):
             return a * np.exp(-(x - x0) ** 2 / (2 * sigma ** 2) + c)
 
-        # from scipy.optimize import curve_fit
-        # plt.figure()
-        # n, bins, _ = plt.hist(bias_array[:, 2])
-        # plt.xlabel('bias in z [nm]')
-        # plt.ylabel('counts')
-        #
-        # popt_bias, pcov_bias = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n, p0=[max(n), np.mean(bias_array[:,2]),
-        #                                                                            np.std(bias_array[:,2]), 0],maxfev=2000)
-        # plt.plot(np.linspace(min(bias_array[:, 2]), max(bias_array[:, 2]), 50),
-        #          gauss(np.linspace(min(bias_array[:, 2]), max(bias_array[:, 2]), 50), *popt_bias), c='red')
-        # plt.title('pattern = ' + str(pattern) + ', kz =' + kzname + ', mean = ' + str(np.round(popt_bias[1],2)))
-        #
-        # plt.savefig(
-        #     path_folder + 'biasoverall' + str(pattern) + '_kz=' + kzname + '.png')
 
-
-        plt.figure(figsize=(10*cm, 8*cm))
+        plt.figure(figsize=(10 * cm, 8 * cm))
         slopex, offset = np.polyfit(mean_array[:, 0], bias_array[:, 2], 1)
-        plt.scatter(mean_array[:, 0], bias_array[:, 2],s=8)
+        plt.scatter(mean_array[:, 0], bias_array[:, 2], s=8)
         plt.plot(mean_array, slopex * mean_array + offset, color='red')
         plt.xlim([min(mean_array[:, 0]), max(mean_array[:, 0])])
         plt.ylim(-100, 100)
         plt.xlabel('x-postion SMLM [nm]')
         plt.ylabel('Bias in z [nm]')
-        #plt.title('pattern = '+ str(pattern) + ', kz =' + kzname )
+        # plt.title('pattern = '+ str(pattern) + ', kz =' + kzname )
         plt.tight_layout(pad=0.1)
         plt.savefig(
-            path_folder + 'bias_z_dep_x' + str(pattern) + '_kz=' + kzname + '.png', dpi=600)
+            self.resultsdir + 'bias_z_dep_x' + '.png', dpi=600)
 
-        plt.figure(figsize=(10*cm, 8*cm))
+        plt.figure(figsize=(10 * cm, 8 * cm))
         slopey, offset = np.polyfit(mean_array[:, 1], bias_array[:, 2], 1)
-        plt.scatter(mean_array[:, 1], bias_array[:, 2],s=8)
+        plt.scatter(mean_array[:, 1], bias_array[:, 2], s=8)
         plt.plot(mean_array, slopey * mean_array + offset, color='red')
         plt.xlim([min(mean_array[:, 1]), max(mean_array[:, 1])])
         plt.ylim(-100, 100)
         plt.xlabel('y-postion SMLM [nm]')
         plt.ylabel('Bias in z [nm]')
-        #plt.title('pattern = ' + str(pattern) + ', kz =' + kzname)
+        # plt.title('pattern = ' + str(pattern) + ', kz =' + kzname)
         plt.tight_layout(pad=0.1)
-        plt.savefig(
-            path_folder + 'bias_z_dep_y' + str(pattern) + '_kz=' + kzname + '.png', dpi=600)
+        plt.savefig(self.resultsdir + 'bias_z_dep_y'   + '.png', dpi=600)
 
-        plt.figure(figsize=(6,6))
+        plt.figure(figsize=(6, 6))
         import scipy.stats
-        # filter_dist_sf = distance_array_sf>45
-        # distance_array_smlm =distance_array_smlm[filter_dist_sf]
-        # distance_array_sf = distance_array_sf[filter_dist_sf]
+
         fit_sf = scipy.stats.norm.fit(distance_array_sf)
         fit_smlm = scipy.stats.norm.fit(np.array(distance_array_smlm))
         binwidth_cluster = 5
         n, bins, _ = plt.hist(distance_array_sf, label='simflux', alpha=0.5, facecolor='red',
-                    bins= np.arange(min(distance_array_sf), max(distance_array_sf) + binwidth_cluster, binwidth_cluster)
-)
-        #filter based on dsitance
+                              bins=np.arange(min(distance_array_sf), max(distance_array_sf) + binwidth_cluster,
+                                             binwidth_cluster)
+                              )
 
 
         try:
 
             popt_sf, pcov_sf = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n, p0=[max(n), fit_sf[0], fit_sf[1], 0],
-                                     maxfev=2000)
+                                         maxfev=2000)
 
             plt.plot(np.linspace(min(distance_array_sf), max(distance_array_sf), 50),
                      gauss(np.linspace(min(distance_array_sf), max(distance_array_sf), 50), *popt_sf), c='red',
@@ -3665,108 +2556,38 @@ class SimfluxProcessor:
         except:
             _ = 0
         n, bins, _ = plt.hist(np.array(distance_array_smlm), label='SMLM', facecolor='blue', alpha=0.5,
-                  bins=np.arange(min(distance_array_smlm), max(distance_array_smlm) + binwidth_cluster, binwidth_cluster))
+                              bins=np.arange(min(distance_array_smlm), max(distance_array_smlm) + binwidth_cluster,
+                                             binwidth_cluster))
 
         try:
-            popt_smlm, pcov_smlm = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n, p0=[max(n), fit_smlm[0], fit_smlm[1], 0],
+            popt_smlm, pcov_smlm = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n,
+                                             p0=[max(n), fit_smlm[0], fit_smlm[1], 0],
                                              maxfev=2000)
             plt.plot(np.linspace(min(distance_array_smlm), 150, 50),
                      gauss(np.linspace(min(distance_array_smlm), 150, 50), *popt_smlm), c='blue', label='SMLM fit')
         except:
-            _=0
+            _ = 0
         # except:
         # n, bins, _ = plt.hist(cart_distance_smlm, label='SMLM', facecolor='blue', alpha=0.5, bins=20)
         # print('do nothing')
         plt.xlabel('Euclidean distance [nm]')
         plt.ylabel('Counts')
-        #plt.legend()
-        if 'popt_smlm' in locals() and 'popt_sf' in locals() :
-            plt.title('mean smlm pos = ' + str(np.round(popt_smlm[1],2)) + ' sf = ' + str(np.round(popt_sf[1],2)) )
+        # plt.legend()
+        if 'popt_smlm' in locals() and 'popt_sf' in locals():
+            plt.title('mean smlm pos = ' + str(np.round(popt_smlm[1], 2)) + ' sf = ' + str(np.round(popt_sf[1], 2)))
 
             plt.title('mean smlm = ' + str(popt_smlm[1]))
             plt.title('mean smlm = ' + str(popt_smlm[1]))
         plt.tight_layout(pad=0)
-        plt.savefig(path_folder + 'clusters' + str(pattern) + '_kz=' + kzname + '.png')
-
-        plt.figure()
-        import scipy.stats
-        #angle_array_smlm = angle_array_smlm[filter_dist_sf]
-        #angle_array_sf = angle_array_sf[filter_dist_sf]
-        fit_sf = scipy.stats.norm.fit(angle_array_sf)
-        fit_smlm = scipy.stats.norm.fit(np.array(angle_array_smlm))
-        binwidth_cluster = 0.3
-        n, bins, _ = plt.hist(angle_array_sf, label='simflux', alpha=0.5, facecolor='red',
-                              bins=np.arange(min(angle_array_sf), max(angle_array_sf) + binwidth_cluster,
-                                             binwidth_cluster)
-                              )
-        # filter based on dsitance
-
-        #try:
-
-        # popt_sf, pcov_sf = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n, p0=[max(n), fit_sf[0], fit_sf[1], 0],
-        #                              maxfev=2000)
-        #
-        # plt.plot(np.linspace(min(angle_array_sf), max(angle_array_sf), 50),
-        #          gauss(np.linspace(min(angle_array_sf), max(angle_array_sf), 50), *popt_sf), c='red',
-        #          label='SF fit')
-        #except:
-            #_ = 0
-        n, bins, _ = plt.hist(np.array(angle_array_smlm), label='SMLM', facecolor='blue', alpha=0.5,
-                              bins=np.arange(min(angle_array_smlm), max(angle_array_smlm) + binwidth_cluster,
-                                             binwidth_cluster))
-
-        #try:
-        # popt_smlm, pcov_smlm = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n,
-        #                                  p0=[max(n), fit_smlm[0], fit_smlm[1], 0],
-        #                                  maxfev=2000)
-        # plt.plot(np.linspace(min(angle_array_smlm), 150, 50),
-        #          gauss(np.linspace(min(angle_array_smlm), 150, 50), *popt_smlm), c='blue', label='SMLM fit')
-        # #except:
-            #_ = 0
-        # except:
-        # n, bins, _ = plt.hist(cart_distance_smlm, label='SMLM', facecolor='blue', alpha=0.5, bins=20)
-        # print('do nothing')
-        plt.xlabel('Angle [rad]')
-        plt.ylabel('Counts')
-        plt.legend()
-        #plt.title('mean smlm pos = ' + str(np.round(popt_smlm[1], 2)) + ' sf = ' + str(np.round(popt_sf[1], 2)))
-        plt.savefig(path_folder + 'angle' + str(pattern) + '_kz=' + kzname + '.png')
-        # plot angle vs length
-        plt.figure(figsize=(6,6))
-        import scipy.stats
-
-        plt.scatter(angle_array_sf, np.array(distance_array_sf), label='simflux', alpha=0.5, facecolor='red')
-        slope_angle_sf = np.polyfit(angle_array_sf,distance_array_sf,1)
-        plt.plot(np.array([0,1.6]), slope_angle_sf[0]* np.array([0,1.6])+ slope_angle_sf[1], color='red', linestyle=':',markersize=0)
-        plt.scatter(angle_array_smlm, distance_array_smlm, label='SMLM', facecolor='blue', alpha=0.5)
-
-        slope_angle_smlm = np.polyfit(angle_array_smlm, distance_array_smlm, 1)
-        plt.plot(np.array([0,1.6]), slope_angle_smlm[0] *np.array([0,1.6]) + slope_angle_smlm[1], color='blue', linestyle=':',markersize=0)
-        # try:
-        # popt_smlm, pcov_smlm = curve_fit(gauss, (bins[1:] + bins[:-1]) / 2, n,
-        #                                  p0=[max(n), fit_smlm[0], fit_smlm[1], 0],
-        #                                  maxfev=2000)
-        # plt.plot(np.linspace(min(angle_array_smlm), 150, 50),
-        #          gauss(np.linspace(min(angle_array_smlm), 150, 50), *popt_smlm), c='blue', label='SMLM fit')
-        # #except:
-        # _ = 0
-        # except:
-        # n, bins, _ = plt.hist(cart_distance_smlm, label='SMLM', facecolor='blue', alpha=0.5, bins=20)
-        # print('do nothing')
-        plt.xlabel('Angle [rad]')
-        plt.ylabel('Length [nm]')
-        #plt.legend()
-        # plt.title('mean smlm pos = ' + str(np.round(popt_smlm[1], 2)) + ' sf = ' + str(np.round(popt_sf[1], 2)))
-        plt.tight_layout(pad=0)
-        plt.savefig(path_folder + 'length_vs_angle' + str(pattern) + '_kz=' + kzname + '.png', dpi=300)
-        #plt.show()
-        plt.close('all')
-
-        return slope_z, std_smlm, std_sf, angle_array_smlm,angle_array_sf, distance_array_smlm,distance_array_sf,mean_array, \
-               full_array_photons_cluster0, full_array_photons_cluster1,full_array_bg_cluster0,full_array_bg_cluster1
+        plt.savefig(self.resultsdir + 'clusters' + '.png')
 
 
-    def cluster_picassopicksv2(self, pattern=0, depth=0, drift_corrected=False, fit_gaussians=False, prefix='0'):
+
+
+        return slope_z, std_smlm, std_sf, angle_array_smlm, angle_array_sf, distance_array_smlm, distance_array_sf, mean_array, \
+               full_array_photons_cluster0, full_array_photons_cluster1, full_array_bg_cluster0, full_array_bg_cluster1
+
+    def cluster_picassopicksv2(self, drift_corrected=False):
         import yaml
         from yaml.loader import SafeLoader
         from sklearn.cluster import KMeans, SpectralClustering
@@ -3776,17 +2597,7 @@ class SimfluxProcessor:
         def gauss(x, a, x0, sigma, c):
             return a * np.exp(-(x - x0) ** 2 / (2 * sigma ** 2) + c)
 
-        folder = 'nanorulers_simflux_10ms_originalanglejan13_2_firstpattern'
-        if pattern != 0:
-            kzname = str(np.round(self.mod[pattern - 1][0][2], 4))
-            filename = "E:/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/all_picks_v2.yaml"
-            # filename = "C:/data/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/pickregions.yaml"
-
-        else:
-            kzname = str(np.round(self.mod[0][0][2], 4)) + '_' + str(np.round(self.mod[1][0][2], 4))
-            filename = "E:/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/all_picks_v2.yaml"
-            # filename = "C:/data/SIMFLUX Z/" + folder + "/results/" + folder + "_MMStack_Default.ome/pickregions.yaml"
-
+        filename = "./all_picks_v2.yaml"
         with open(filename) as f:
             data = yaml.load(f, Loader=SafeLoader)
 
@@ -3794,17 +2605,16 @@ class SimfluxProcessor:
         diameter = data['Diameter']
         if drift_corrected:
             pos_smlm = self.sum_ds_filtered_undrift.pos
-            pos_sf = self.sf_ds_undrift.pos
-            photons_sf = self.sf_ds_undrift.photons
-            bg_sf = self.sf_ds_undrift.background
+            pos_sf = self.zf_ds_undrift.pos
+            photons_sf = self.zf_ds_undrift.photons
+            bg_sf = self.zf_ds_undrift.background
             photons_all_smlm = self.sum_ds_filtered_undrift.photons
             bg_all_smlm = self.sum_ds_filtered_undrift.background
         else:
-
             pos_smlm = self.sum_ds_filtered.pos
-            pos_sf = self.sf_ds.pos
-            photons_sf = self.sf_ds.photons
-            bg_sf = self.sf_ds.background
+            pos_sf = self.zf_ds.pos
+            photons_sf = self.zf_ds.photons
+            bg_sf = self.zf_ds.background
             photons_all_smlm = self.sum_ds_filtered.photons
             bg_all_smlm = self.sum_ds_filtered.background
         bias_array = np.empty((0, 3))
@@ -4053,216 +2863,6 @@ class SimfluxProcessor:
                [mean_array_cluster0, mean_array_cluster1,  full_array_photons_cluster0_smlm, full_array_photons_cluster1_smlm, full_array_bg_cluster0_smlm, full_array_bg_cluster1_smlm],\
                [mean_array_cluster0_sf, mean_array_cluster1_sf,  full_array_photons_cluster0, full_array_photons_cluster1, full_array_bg_cluster0, full_array_bg_cluster1]
 
-    def clustercrap(self,ds, ds2, dist_factor=4,minpoints = 30, torch=False):
-        from photonpy import Context, PostProcessMethods
-
-        with Context() as ctx:
-            crlb = ds.crlb['pos']
-            if torch == True:
-                crlb = crlb + 0.15
-            crlb = crlb[:, 0:2] *dist_factor
-            pts = ds.pos[:, 0:2]
-            dist = np.mean(crlb) * dist_factor
-
-            clusterpos, cl_crlb, mapping = PostProcessMethods(ctx).ClusterLocs(pts, crlb, dist)
-
-            plt.scatter(clusterpos[:, 0], clusterpos[:, 1], s=1, marker='o', label='Cluster mean')
-
-            plt.legend()
-
-            values = np.histogram(mapping, bins=np.size(clusterpos, 0))
-            final_clusters = clusterpos[values[0] > minpoints]
-            plt.figure(figsize=(30, 30))
-            plt.scatter(pts[:, 0], pts[:, 1], c=mapping, s=1, marker='o')
-
-            for k in range(len(final_clusters)):
-                circle = plt.Circle((final_clusters[k, 0], final_clusters[k, 1]), dist, color='r', fill=False)
-                plt.gca().add_artist(circle)
-        list_ds = []
-        pos3d = ds.pos
-        avg_z = np.zeros(np.size(final_clusters, 0))
-        avg_xy = np.zeros((np.size(final_clusters, 0),2))
-        for qq in range(np.size(final_clusters, 0)):
-            center = final_clusters[qq, :]
-            temp = (pos3d[:, 0] - center[0]) ** 2 + (pos3d[:, 1] - center[1]) ** 2
-            array_filter = temp <= dist ** 2
-            avg_z[qq] = np.mean(pos3d[array_filter, 2])
-            avg_xy[qq] = np.mean(pos3d[array_filter, 0:2], axis=0)
-            list_ds.append(pos3d[array_filter,:])
-        if ds2 != None:
-            pos3d_ds2 = ds2.pos
-            avg_z_ds2 = np.zeros(np.size(final_clusters, 0))
-            avg_xy_ds2 = np.zeros((np.size(final_clusters, 0), 2))
-            for qq in range(np.size(final_clusters, 0)):
-                center = final_clusters[qq, :]
-                temp = (pos3d_ds2[:, 0] - center[0]) ** 2 + (pos3d_ds2[:, 1] - center[1]) ** 2
-                array_filter = temp <= dist ** 2
-                avg_z_ds2[qq] = np.mean(pos3d_ds2[array_filter, 2])
-                avg_xy_ds2[qq] = np.mean(pos3d_ds2[array_filter, 0:2],axis=0)
-            z_bias = avg_z - avg_z_ds2
-            xybias = avg_xy - avg_xy_ds2
-            nan = np.isnan(z_bias)
-            z_bias = z_bias[np.logical_not(nan)]
-            avg_z = avg_z[np.logical_not(nan)]
-            return avg_z, final_clusters, z_bias, avg_xy, xybias, list_ds
-        else:
-            return avg_z, final_clusters, 0, 0, 0, list_ds
-
-    def extract_phase_pos_fixedroi(self, static_roi):
-
-        pos1 = np.zeros((np.max(static_roi), 7))
-        map_sumds1 = []
-        phase1 = []
-
-        for i in range(max(static_roi)):
-            roi_id = self.sum_ds.roi_id_filtered
-            set1 = static_roi == i
-            joe = np.where(set1 == True)[0]
-            # true index for non-filtered roi through frames.
-            true_index = np.where(np.in1d(roi_id, joe))
-            map_sumds1.append(true_index)
-            pos = self.sum_ds.pos_filtered[true_index]
-            phase = self.sum_ds.params_sine_filtered[true_index, 1]
-            num_spots = np.size(pos, 1)
-            if num_spots != 0:
-                phase1.append(phase)
-
-                pos1[i, 0] = num_spots
-                pos1[i, 1:4] = np.mean(pos, axis=1)
-                pos1[i, 4:7] = np.std(pos, axis=1)
-            else:
-                phase1.append(0)
-
-        return phase1, pos1, np.array(map_sumds1)
-
-    def compute_phase_shift_zstack(path, path2, cfg, maxlinking=3):
-        from photonpy.simflux import SimfluxProcessor
-        import trackpy
-        import numpy as np
-        import pandas as pd
-        sp = SimfluxProcessor(path, cfg)
-        sp2 = SimfluxProcessor(path2, cfg)
-
-        sp.detect_rois(ignore_cache=False)
-        sp2.detect_rois(ignore_cache=False)
-        sp.gaussian_fitting()
-        sp2.gaussian_fitting()
-        # sp.view_rois()
-        import matplotlib.pyplot as plt
-        import scipy
-        sp.fit_sine()
-        sp2.fit_sine()
-
-        sp.filter_onR(filter=0.05, min_mod=0.5)
-        sp2.filter_onR(filter=0.05, min_mod=0.5)
-        plt.show()
-        params = np.append(np.append(sp.sum_ds.local_pos_filtered, sp.sum_ds.photons_filtered[:, None], axis=1),
-                           sp.sum_ds.background_filtered[:, None], axis=1)
-        trackdata = pd.DataFrame()
-        trackdata['x'] = sp.sum_ds.pos_filtered[:, 0]
-        trackdata['y'] = sp.sum_ds.pos_filtered[:, 1]
-        trackdata['frame'] = sp.sum_ds.frame_filtered[:]
-        trackdata['phase_pat1'] = sp.sum_ds.params_sine_filtered[:, 1, 0]
-        trackdata['phase_pat2'] = sp.sum_ds.params_sine_filtered[:, 1, 1]
-        trackdata['zpos'] = sp.sum_ds.pos_filtered[:, 2]
-        trackdata['roid'] = sp.sum_ds.roi_id_filtered[:]
-
-        trackdata2 = pd.DataFrame()
-        trackdata2['x'] = sp2.sum_ds.pos_filtered[:, 0]
-        trackdata2['y'] = sp2.sum_ds.pos_filtered[:, 1]
-        trackdata2['zpos'] = sp2.sum_ds.pos_filtered[:, 2]
-        trackdata2['frame'] = sp2.sum_ds.frame_filtered[:]
-        trackdata2['phase_pat1'] = sp2.sum_ds.params_sine_filtered[:, 1, 0]
-        trackdata2['phase_pat2'] = sp2.sum_ds.params_sine_filtered[:, 1, 1]
-        trackdata2['roid'] = sp2.sum_ds.roi_id_filtered[:]
-
-        # sp1 are even frames, sp2 are uneven frames
-        trackdata['frame'] = trackdata['frame'] * 2
-        trackdata2['frame'] = trackdata2['frame'] * 2 + 1
-        combined_data = trackdata.append(trackdata2, ignore_index=True)
-        trackpy.quiet()
-        trackdata_comb = trackpy.link(combined_data, maxlinking, memory=3)
-
-        # trackpy.plot_traj(trackdata_comb)
-        # plt.show()
-        shift_data = pd.DataFrame()
-        for i in range(max(trackdata_comb['particle'] + 1)):
-            particle = trackdata_comb[trackdata_comb['particle'] == i]
-            odd_frames = particle[particle['frame'] % 2 != 0]
-            even_frames = particle[particle['frame'] % 2 == 0]
-            if even_frames.shape[0] != 0 and odd_frames.shape[0] != 0:
-                temp = pd.DataFrame()
-                temp['xdrift'] = [np.mean(odd_frames['x']) - np.mean(even_frames['x'])]
-                temp['ydrift'] = [np.mean(odd_frames['y']) - np.mean(even_frames['y'])]
-                temp['particle'] = [i]
-                temp['zpos1_avg'] = np.mean(even_frames['zpos'])
-                temp['zpos2_avg'] = np.mean(odd_frames['zpos'])
-                temp['deltaz'] = np.mean(odd_frames['zpos']) - np.mean(even_frames['zpos'])
-                temp['roi_ids_firstslice'] = [np.array(even_frames['roid'])]
-                temp['roi_ids_secondslice'] = [np.array(odd_frames['roid'])]
-
-                for name in ['phase_pat1', 'phase_pat2']:
-                    if odd_frames.shape[0] < even_frames.shape[0]:
-                        meanshift = np.zeros(odd_frames.shape[0])
-                        for qq in range(odd_frames.shape[0]):
-                            phase_odd = np.array(odd_frames[name])[qq]
-
-                            shift = np.zeros(even_frames.shape[0])
-                            for ww in range(even_frames.shape[0]):
-                                phase_even = np.array(even_frames[name])[ww]
-                                shift[ww] = phase_odd - phase_even
-                                if abs(shift[ww]) > np.pi:
-                                    if shift[ww] < 0:
-                                        shift[ww] = shift[ww] + 2 * np.pi
-                                    elif shift[ww] > 0:
-                                        shift[ww] = shift[ww] - 2 * np.pi
-                                    else:
-                                        print('ERROR')
-                            meanshift[qq] = np.mean(shift)
-                        temp[name + '_shift'] = np.mean(meanshift)
-                    if odd_frames.shape[0] >= even_frames.shape[0]:
-                        meanshift = np.zeros(even_frames.shape[0])
-                        for qq in range(even_frames.shape[0]):
-                            phase_even = np.array(even_frames[name])[qq]
-
-                            shift = np.zeros(odd_frames.shape[0])
-                            for ww in range(odd_frames.shape[0]):
-                                phase_odd = np.array(odd_frames[name])[ww]
-                                shift[ww] = phase_odd - phase_even
-                                if abs(shift[ww]) > np.pi:
-                                    if shift[ww] < 0:
-                                        shift[ww] = shift[ww] + 2 * np.pi
-                                    elif shift[ww] > 0:
-                                        shift[ww] = shift[ww] - 2 * np.pi
-                                    else:
-                                        print('ERROR')
-                            meanshift[qq] = np.mean(shift)
-                        temp[name + '_shift'] = np.mean(meanshift)
-                temp['num_spots_even'] = even_frames.shape[0]
-                temp['num_spots_odd'] = odd_frames.shape[0]
-                shift_data = shift_data.append(temp)
-        return shift_data, sp, sp2
-
-    def view_rois_concatv2(self, pxstack, map1, calib):
-        from photonpy.cpp.gaussian import GaussianPSFMethods, Gauss3D_Calibration
-
-        pxstack = np.sum(pxstack, axis=1)
-
-        pxconcat = np.zeros([len(map1), 2 * np.size(pxstack, 1), np.size(pxstack, 2)])
-        for i in range(len(map1)):
-            px = pxstack[self.sum_ds.roi_id_filtered[map1[i][0][0]]]
-
-            gpm = GaussianPSFMethods(ctx=Context(debugMode=False))
-            calib2 = Gauss3D_Calibration(calib['x'], calib['y'])
-            p = np.zeros(5)
-            p[:3] = self.sum_ds.local_pos_filtered[map1[i][0][0], :]
-            p[3], p[4] = self.sum_ds.photons_filtered[map1[i][0][0]], self.sum_ds.background_filtered[map1[0][0][0]]
-
-            psf_astig = gpm.CreatePSF_XYZIBg(self.roisize, calib2, cuda=True)
-
-            pxconcat_optimalpsf = psf_astig.ExpectedValue(p)[0, :, :]
-            pxconcat[i] = np.append(px, pxconcat_optimalpsf, axis=0)
-        return pxconcat
 
 
 def view_napari(mov):
@@ -4281,119 +2881,4 @@ def set_plot_fonts():
         "svg.fonttype": 'none'} #to store text as text, not as path
     mpl.rcParams.update(new_rc_params)
 
-
-def estimate_patterns(self, num_angle_bins=1,
-                      num_phase_bins=10,
-                      pitch_minmax_nm=[300, 1500],
-                      p_ax=0,
-                      fix_phase_shifts=None,
-                      fix_depths=None,
-                      show_plots=True,
-                      phase_method=1,
-                      dft_peak_search_range=0.02):
-    self.estimate_angles(num_angle_bins, pitch_minmax_nm, dft_peak_search_range, debug_images=False, p_ax=p_ax)
-
-    fr = np.arange(self.sum_ds.numFrames)
-    frame_bins = np.array_split(fr, num_phase_bins)
-    frame_bins = [b for b in frame_bins if len(b) > 0]
-
-    k = self.mod['k'][:, :self.excDims]
-    phase, depth, power = self.spotlist.estimate_phase_and_depth(k, self.pattern_frames, frame_bins,
-                                                                 method=phase_method)
-    phase_all, depth_all, power_all = self.spotlist.estimate_phase_and_depth(k, self.pattern_frames, [fr],
-                                                                             method=phase_method)
-
-    # store interpolated phase for every frame
-    frame_bin_t = [np.mean(b) for b in frame_bins]
-    self.phase_interp = np.zeros((len(fr), self.pattern_frames.size))
-    for k in range(self.pattern_frames.size):
-        phase[:, k] = unwrap_angle(phase[:, k])
-        spl = InterpolatedUnivariateSpline(frame_bin_t, phase[:, k], k=2)
-        self.phase_interp[:, k] = spl(fr)
-
-    fig = plt.figure(figsize=figsize)
-    styles = ['o', "x", "*", 'd']
-    for ax, idx in enumerate(self.pattern_frames):
-        for k in range(len(idx)):
-            p = plt.plot(fr, self.phase_interp[:, idx[k]] * 180 / np.pi, ls='-')
-            plt.plot(frame_bin_t, phase[:, idx[k]] * 180 / np.pi, ls='', c=p[0].get_color(),
-                     marker=styles[ax % len(styles)], label=f"Phase {idx[k]} (axis {ax})")
-    plt.legend()
-    plt.title(f"Phases for {self.src_fn}")
-    plt.xlabel("Frame number");
-    plt.ylabel("Phase [deg]")
-    plt.grid()
-    plt.tight_layout()
-    fig.savefig(self.resultprefix + "phases.png")
-    if not show_plots: plt.close(fig)
-
-    fig = plt.figure(figsize=figsize)
-    for ax, idx in enumerate(self.pattern_frames):
-        for k in range(len(idx)):
-            plt.plot(frame_bin_t, depth[:, idx[k]], styles[ax % len(styles)], ls='-',
-                     label=f"Depth {idx[k]} (axis {ax})")
-    plt.legend()
-    plt.title(f"Depths for {self.src_fn}")
-    plt.xlabel("Frame number");
-    plt.ylabel("Modulation Depth")
-    plt.grid()
-    plt.tight_layout()
-    fig.savefig(self.resultprefix + "depths.png")
-    if not show_plots: plt.close(fig)
-
-    fig = plt.figure(figsize=figsize)
-    for ax, idx in enumerate(self.pattern_frames):
-        for k in range(len(idx)):
-            plt.plot(frame_bin_t, power[:, idx[k]], styles[ax % len(styles)], ls='-',
-                     label=f"Power {idx[k]} (axis {ax})")
-    plt.legend()
-    plt.title(f"Power for {self.src_fn}")
-    plt.xlabel("Frame number");
-    plt.ylabel("Modulation Power")
-    plt.grid()
-    plt.tight_layout()
-    fig.savefig(self.resultprefix + "power.png")
-    if not show_plots: plt.close(fig)
-
-    # Update mod
-    phase_std = np.zeros(len(self.mod))
-    for k in range(len(self.mod)):
-        ph_k = unwrap_angle(phase[:, k])
-        self.mod['phase'][k] = phase_all[0, k]
-        self.mod['depth'][k] = depth_all[0, k]
-        self.mod['relint'][k] = power_all[0, k]
-        phase_std[k] = np.std(ph_k)
-
-    s = np.sqrt(num_phase_bins)
-    for k in range(len(self.mod)):
-        self.report(
-            f"Pattern {k}: Phase {self.mod[k]['phase'] * 180 / np.pi:8.2f} (std={phase_std[k] / s * 180 / np.pi:6.2f}) " +
-            f"Depth={self.mod[k]['depth']:5.2f} (std={np.std(depth[:, k]) / s:5.3f}) " +
-            f"Power={self.mod[k]['relint']:5.3f} (std={np.std(power[:, k]) / s:5.5f}) ")
-
-    # mod=self.spotlist.refine_pitch(mod, self.ctx, self.spotfilter, plot=True)[2]
-
-    for angIndex in range(len(self.pattern_frames)):
-        self.mod[self.pattern_frames[angIndex]]['relint'] = np.mean(self.mod[self.pattern_frames[angIndex]]['relint'])
-        # Average modulation depth
-        self.mod[self.pattern_frames[angIndex]]['depth'] = np.mean(self.mod[self.pattern_frames[angIndex]]['depth'])
-
-    self.mod['relint'] /= np.sum(self.mod['relint'])
-
-    if fix_depths:
-        self.report(f'Fixing modulation depth to {fix_depths}')
-        self.mod['depth'] = fix_depths
-
-    self.report("Final modulation pattern parameters:")
-    print_mod(self.report, self.mod, self.pattern_frames, self.pixelsize)
-
-    with open(self.mod_fn, "wb") as f:
-        pickle.dump((self.mod, self.phase_interp), f)
-
-    med_sum_I = np.median(self.sum_ds.data.IBg[:, :, 0].sum(1))
-    lowest_power = np.min(self.mod['relint'])
-    depth = self.mod[np.argmin(self.mod['relint'])]['depth']
-    median_intensity_at_zero = med_sum_I * lowest_power * (1 - depth)
-    self.report(
-        f"Median summed intensity: {med_sum_I:.1f}. Median intensity at pattern zero: {median_intensity_at_zero:.1f}")
 

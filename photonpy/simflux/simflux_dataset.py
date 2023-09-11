@@ -8,10 +8,12 @@ Created on Mon Apr 12 21:00:53 2021
 from photonpy import Dataset
 import numpy as np
 
-class SFDataset (Dataset):
+
+class SFDataset(Dataset):
     """
     Dataset that holds an array of intensity values per spot
     """
+
     def __init__(self, length, dims, imgshape, numPatterns=None, config=None, **kwargs):
 
         if config is None:
@@ -21,20 +23,19 @@ class SFDataset (Dataset):
         if numPatterns is not None:
             config['numPatterns'] = numPatterns
 
-        super().__init__(length, dims, imgshape, config=config,**kwargs)
-    
-    def createDTypes(self,dims, imgdims, includeGaussSigma, extraFields=None):
+        super().__init__(length, dims, imgshape, config=config, **kwargs)
+
+    def createDTypes(self, dims, imgdims, includeGaussSigma, extraFields=None):
         numPatterns = self.config['numPatterns']
 
-        extraFields  = [
+        extraFields = [
             ('IBg', np.float32, (numPatterns, 2)),
             ('IBg_crlb', np.float32, (numPatterns, 2))
         ]
-        
+
         return super().createDTypes(dims, imgdims, includeGaussSigma, extraFields=extraFields)
 
     @property
     def IBg(self):
         return self.data.IBg
-    
-    
+
